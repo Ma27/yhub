@@ -569,6 +569,7 @@ const yhub = await createYHub({
       // deleteVersions: false,  // versioned buckets: only place delete markers (default: erase versions)
       // retryDelay: 1000,       // ms to wait before retrying a transient failure (default: 1000)
       // deleteDelay: 10000,     // ms to defer an erase, keep >= 10000 (default: 10000)
+      // requestTimeout: 60000,  // ms a request's socket may stay silent before it is aborted, 0 disables (default: 60000)
     })
   ],
   server: { /* ... */ },
@@ -600,6 +601,14 @@ deferred delete: nothing observes its result, so a failure there would orphan th
 bucket. `retryDelay` is the pause before that second attempt, in milliseconds (default `1000`),
 giving a dead socket time to be discarded before it is reused. Anything that is not transient is
 never retried.
+
+A store that accepts a request but stops answering would otherwise hold it forever — and with it
+the compaction or the initial sync that needs it. `requestTimeout` (default `60000`) aborts a
+request whose socket sends or receives nothing for that many milliseconds, with `ETIMEDOUT`:
+transient, so it is retried once like above. It bounds inactivity, not the total duration — an
+upload or download that keeps making progress is never cut off, and S3 keeps a long
+CompleteMultipartUpload alive by sending whitespace. Idle keepalive sockets are closed after the
+same time. `0` disables the timeout.
 
 Separately, `delete` does not erase the object immediately: it waits `deleteDelay` milliseconds
 (default `10000`) so that a reader which already resolved the reference can still fetch the bytes.

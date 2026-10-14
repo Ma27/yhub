@@ -572,9 +572,10 @@ export const createYHub = async conf => {
     conf.server.maxVersionSize ??= 64 * 1024
     // `null` disables the keep-alive, so `??=` won't do
     if (conf.server.wsKeepAliveInterval === undefined) conf.server.wsKeepAliveInterval = 20000
+    conf.server.authTimeout ??= 10000
   }
   const stream = await strm.createStream(conf)
-  const pers = await p.createPersistence(conf.postgres, conf.persistence)
+  const pers = await p.createPersistence(conf.postgres, conf.persistence, conf.postgresOptions)
   const yhub = new YHub(conf, stream, pers)
   await promise.all(conf.persistence.map(p => p.init?.(yhub)))
   if (conf.server != null) {

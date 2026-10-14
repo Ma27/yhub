@@ -59,7 +59,7 @@ const ydocEndpoint = createApiEndpoint('ydoc', {
         // compute queue into a 503
         if (err instanceof DocDeletedError || isComputeQueueFull(err)) throw err
         log.error({ err, docRef: req.docRef }, 'error handling ydoc request')
-        throw apiError(500, 'Failed to retrieve document')
+        throw apiError(500, 'Failed to retrieve document', { code: 'internal-error' })
       }
     }
   },
@@ -78,7 +78,7 @@ const ydocEndpoint = createApiEndpoint('ydoc', {
     handler: async req => {
       const { update, customAttributions = [] } = req.body
       if (update == null && req.body.awareness == null) {
-        throw apiError(400, 'Invalid request body')
+        throw apiError(400, 'Invalid request body', { code: 'invalid-body' })
       }
       // presence without awareness `u` is dropped, not refused - same as a cursor sent over a
       // socket lacking the bit. Only the update leg is a hard requirement, checked before the
@@ -115,7 +115,7 @@ const rollbackEndpoint = createApiEndpoint('rollback', {
     handler: async req => {
       const { from, to, by, contentIds, customAttributions = [], withCustomAttributions = null } = req.body
       if (!from && !to && !by && !contentIds && (withCustomAttributions ?? []).length === 0) {
-        throw apiError(400, 'Rollback requires at least one filter (from, to, by, contentIds, or withCustomAttributions)')
+        throw apiError(400, 'Rollback requires at least one filter (from, to, by, contentIds, or withCustomAttributions)', { code: 'missing-filter' })
       }
       // mutations refuse, never clamp: the requested range starts at `from` regardless of the
       // other filters, so a filter-only rollback is unbounded and demands the full ray - a
@@ -143,7 +143,7 @@ const pruneEndpoint = createApiEndpoint('prune', {
     handler: async req => {
       const { from, to, by, contentIds, withCustomAttributions = null } = req.body
       if (!from && !to && !by && !contentIds && (withCustomAttributions ?? []).length === 0) {
-        throw apiError(400, 'Prune requires at least one filter (from, to, by, contentIds, or withCustomAttributions)')
+        throw apiError(400, 'Prune requires at least one filter (from, to, by, contentIds, or withCustomAttributions)', { code: 'missing-filter' })
       }
       // see rollback: mutations refuse, never clamp
       checkPermissions(req.permissions, createDocumentPermissions({ history: { from: from ?? 0, prune: true } }))
@@ -198,7 +198,7 @@ const changesetEndpoint = createApiEndpoint('changeset', {
         // the error log. registerApi turns this into a 404, and a full compute queue into a 503.
         if (err instanceof DocDeletedError || isComputeQueueFull(err)) throw err
         log.error({ err, docRef }, 'error handling changeset request')
-        throw apiError(500, 'Failed to compute changeset')
+        throw apiError(500, 'Failed to compute changeset', { code: 'internal-error' })
       }
     }
   }
@@ -272,7 +272,7 @@ const activityEndpoint = createApiEndpoint('activity', {
         // see the changeset endpoint
         if (err instanceof DocDeletedError || isComputeQueueFull(err)) throw err
         log.error({ err, docRef }, 'error handling activity request')
-        throw apiError(500, 'Failed to compute activity')
+        throw apiError(500, 'Failed to compute activity', { code: 'internal-error' })
       }
     }
   }

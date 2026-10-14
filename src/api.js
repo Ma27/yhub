@@ -138,22 +138,49 @@ export class EncodedAny {
 export const encodedAny = bytes => new EncodedAny(bytes)
 
 /**
- * Run one auth hook. A branded apiError is the plugin's own answer - a 401 from `authenticate`
- * rejecting a credential, a 503 outage from either hook - and passes through; any other throw is
- * an infrastructure failure: 503, transient like the ws recheck's 1013. Deny is a value on both
- * hooks (`authenticate` → null: an anonymous caller; `authorize` → null: no permissions).
+ * Settle with `p`, or reject with a branded 503 `auth timeout` once `server.authTimeout` ms have
+ * passed - a hung auth plugin must not hold a rest request, a ws upgrade or a recheck forever.
+ * The plugin call can't be cancelled; it is abandoned.
  *
  * @template T
+ * @param {import('./index.js').YHub} yhub
+ * @param {'authenticate'|'authorize'} hook
+ * @param {Promise<T>} p
+ * @return {Promise<T>}
+ */
+export const withAuthTimeout = (yhub, hook, p) => {
+  const timeout = /** @type {number} */ (yhub.conf.server?.authTimeout)
+  /**
+   * @type {ReturnType<typeof setTimeout>|undefined}
+   */
+  let timer
+  return Promise.race([p, promise.create((_resolve, reject) => {
+    timer = setTimeout(() => {
+      log.warn({ hook, timeout }, 'auth plugin timed out')
+      reject(apiError(503, 'auth timeout', { code: 'auth-timeout' }))
+    }, timeout)
+  })]).finally(() => clearTimeout(timer))
+}
+
+/**
+ * Run one auth hook, bounded by `server.authTimeout`. A branded apiError is the plugin's own
+ * answer - a 401 from `authenticate` rejecting a credential, a 503 outage from either hook - and
+ * passes through, as does the timeout's 503; any other throw is an infrastructure failure: 503,
+ * transient like the ws recheck's 1013. Deny is a value on both hooks (`authenticate` → null: an
+ * anonymous caller; `authorize` → null: no permissions).
+ *
+ * @template T
+ * @param {import('./index.js').YHub} yhub
  * @param {'authenticate'|'authorize'} hook
  * @param {() => Promise<T>} run
  */
-const runAuthHook = async (hook, run) => {
+const runAuthHook = async (yhub, hook, run) => {
   try {
-    return await run()
+    return await withAuthTimeout(yhub, hook, run())
   } catch (err) {
     if (isApiError(err)) throw err
     log.warn({ err, hook }, 'auth plugin failed')
-    throw apiError(503, `${hook} unavailable`)
+    throw apiError(503, `${hook} unavailable`, { code: 'auth-unavailable' })
   }
 }
 
@@ -196,9 +223,9 @@ export const normalizeAuthorizeAnswer = (scope, answer) => {
  */
 export const resolvePermissions = async (yhub, req, scope, resourceId) => {
   const auth = /** @type {t.AuthPlugin<any>} */ (yhub.conf.server?.auth)
-  const authInfo = await runAuthHook('authenticate', () => auth.authenticate(req))
+  const authInfo = await runAuthHook(yhub, 'authenticate', () => auth.authenticate(req))
   if (authInfo != null) s.$string.expect(authInfo.userid)
-  const answer = await runAuthHook('authorize', () => auth.authorize(scope, resourceId, authInfo))
+  const answer = await runAuthHook(yhub, 'authorize', () => auth.authorize(scope, resourceId, authInfo))
   return { authInfo, permissions: normalizeAuthorizeAnswer(scope, answer) }
 }
 
@@ -611,7 +638,7 @@ const createApiHandler = (yhub, { method, handler, scope, requiredEndpoint, path
         sendErrorResponse(res, writeHeaders, statusLine(503), { error: 'compute queue full', code: 'compute-queue-full' }, acceptsJson)
       } else {
         log.error({ err, path }, 'error handling api request')
-        sendErrorResponse(res, writeHeaders, '500 Internal Server Error', { error: 'Internal server error' }, acceptsJson)
+        sendErrorResponse(res, writeHeaders, '500 Internal Server Error', { error: 'Internal server error', code: 'internal-error' }, acceptsJson)
       }
     })
   } catch (err) {
@@ -620,7 +647,7 @@ const createApiHandler = (yhub, { method, handler, scope, requiredEndpoint, path
       log.debug({ err }, 'api request could not be read')
     } else {
       log.error({ err }, 'error handling api request')
-      sendErrorResponse(res, writeHeaders, '500 Internal Server Error', { error: 'Internal server error' }, acceptsJson)
+      sendErrorResponse(res, writeHeaders, '500 Internal Server Error', { error: 'Internal server error', code: 'internal-error' }, acceptsJson)
     }
   }
 }

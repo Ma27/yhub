@@ -37,3 +37,16 @@ export const testPersistencePluginDelete = _tc => {
   // plugin is what proves the key is really part of `$persistencePlugin` now.
   t.fails(() => types.$config.expect(/** @type {any} */ ({ ...baseConf, persistence: [{ init: async () => {}, delete: 'nope' }] })))
 }
+
+/**
+ * The timeout options: `postgresOptions` is handed to the postgres client as is,
+ * `server.authTimeout` bounds the auth plugin.
+ *
+ * @param {t.TestCase} _tc
+ */
+export const testTimeoutOptions = _tc => {
+  types.$config.expect({ ...baseConf, persistence: [], postgresOptions: { max: 5, idle_timeout: 30, connection: { statement_timeout: 30000 } } })
+  const auth = types.createAuthPlugin({ authenticate: async () => null, authorize: async () => null })
+  types.$config.expect({ ...baseConf, persistence: [], server: { port: 4400, auth, authTimeout: 5000 } })
+  t.fails(() => types.$config.expect(/** @type {any} */ ({ ...baseConf, persistence: [], server: { port: 4400, auth, authTimeout: '5s' } })))
+}

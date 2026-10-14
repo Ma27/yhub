@@ -234,7 +234,7 @@ export const testPruneHistoryRequiresFilter = async tc => {
   ydoc.get().applyDelta(delta.create().insert('content').done())
   await promise.wait(100)
   const emptyPrune = await postYhubRequest(`/api/prune/v1/${org}/${ydoc.guid}`, {})
-  t.assert(emptyPrune.error != null, 'prune without filters should return an error')
+  t.assert(emptyPrune.code === 'missing-filter', 'prune without filters should return an error')
 }
 
 /**
@@ -390,7 +390,7 @@ export const testCustomAttributionsRollback = async tc => {
 
   // Rollback without any filter should return an error
   const emptyRollback = await postYhubRequest(`/api/rollback/v1/${org}/${initialDoc.guid}`, {})
-  t.assert(emptyRollback.error != null, 'Rollback without filters should return an error')
+  t.assert(emptyRollback.code === 'missing-filter', 'Rollback without filters should return an error')
 
   // Rollback only changes with source=userA
   const rollbackResult = await postYhubRequest(`/api/rollback/v1/${org}/${initialDoc.guid}`, {
@@ -838,7 +838,7 @@ export const testPatchEmptyBodyIs400 = async tc => {
   const { org, createWsClient } = await utils.createTestCase(tc)
   const { ydoc } = await createWsClient({ waitForSync: true, syncAwareness: false })
   const res = await patchYhubRequest(`/api/ydoc/v1/${org}/${ydoc.guid}`, {})
-  t.assert(res.error === 'Invalid request body', `expected 400 error body, got ${JSON.stringify(res)}`)
+  t.assert(res.error === 'Invalid request body' && res.code === 'invalid-body', `expected 400 error body, got ${JSON.stringify(res)}`)
 }
 
 /**

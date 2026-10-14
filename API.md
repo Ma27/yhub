@@ -60,7 +60,7 @@ when codes are added:
 | `4400`–`4499` | permanent yhub errors — `4401` permission revoked: the permissions the socket consumes (the ydoc mask, the awareness mask, the effective `ws` endpoint mask, or `gc=false`'s full-history requirement) changed on a re-check (see [`yhub.recheckAuth`](#yhubrecheckauthdocref-opts); exported as `wsCloseAuthRevoked`), `4404` document deleted (see [`yhub.deleteDoc`](#yhubdeletedocdocref-opts); exported as `wsCloseDocDeleted`) | no — act first (e.g. re-authenticate, or drop the local copy), then reconnect deliberately |
 | `4500`–`4599` | transient yhub errors — `4503` server shutting down (see [`yhub.destroy`](#yhubdestroyopts); exported as `wsCloseDraining`) | yes — another instance behind the load balancer takes the connection |
 | `1011` | internal error — initial sync, message handling, or stream relay failed | yes |
-| `1013` | try again later — backpressure limit exceeded, `authorize` threw during a re-check (the permission backend is down, not the grant revoked), or the initial sync found the compute queue full (see `computePool.maxQueue` in [`createYHub`](#createyhubconfig)) | yes |
+| `1013` | try again later — backpressure limit exceeded, `authorize` threw or exceeded `server.authTimeout` during a re-check (the permission backend is down, not the grant revoked), or the initial sync found the compute queue full (see `computePool.maxQueue` in [`createYHub`](#createyhubconfig)) | yes |
 | `1002` `1003` `1008` | standard permanent codes — yhub never sends them | no |
 | *(none)* | closed without a close frame — browsers report `1006`, `@y/websocket` emits `connection-close` with `event = null` | yes |
 
@@ -72,9 +72,9 @@ proxy failures. Always transient.
 A denied upgrade is HTTP, never a close code: `401` a credential the auth plugin rejected, or an
 anonymous caller granted ydoc `u` (writing needs an identity), `403` insufficient access
 or an origin the CORS config does not allow (see [CORS](#cors)),
-`503` the auth plugin failed (or the status of a branded `apiError` it threw, e.g. `503` while its
-backend is down). Browsers can't observe upgrade statuses — the client only sees a failed connection
-attempt. `4401` is the explicit stop signal; a client that ignores it reconnects into a `403`
+`503` the auth plugin failed or exceeded `server.authTimeout` (`auth timeout`) — or the status of a
+branded `apiError` it threw, e.g. `503` while its backend is down. Browsers can't observe upgrade
+statuses — the client only sees a failed connection attempt. `4401` is the explicit stop signal; a client that ignores it reconnects into a `403`
 loop against your auth backend.
 
 `@y/websocket` reconnects after **every** close, regardless of code — apply the rule in the app:
@@ -99,12 +99,12 @@ Error responses carry a lib0-any encoded `{ error: string, ...extra }` body (see
 
 | Status | Sent when | Retry? |
 |---|---|---|
-| `400` `404` `409` `413` `422` | caller mistake — invalid body or query (`code: 'invalid-body'` / `'invalid-query'`), missing resource, conflict, payload too large | no — fix the request |
+| `400` `404` `409` `413` `422` | caller mistake — invalid body or query (`code: 'invalid-body'` / `'invalid-query'`), a rollback or prune without a filter (`code: 'missing-filter'`), missing resource, conflict, payload too large | no — fix the request |
 | `401` `403` | `401`: the auth plugin rejected a presented credential (a branded `apiError(401)`), or an anonymous caller tried to write the document or a named version (`code: 'unauthenticated'` — attributions carry the userid; see [Anonymous callers](#contracts)); `403`: no access | no — obtain fresh credentials, then send a new request |
 | `403` with `code: 'missing-permission'` | the caller is authenticated but its permissions don't contain what the request requires — the message reads `requires permission {...}` and the `required` field carries the request's whole requirement as a permission object of the route's scope, e.g. `{ type: 'permissions:document:v1', ydoc: '--u-' }` or `{ type: 'permissions:document:v1', delete: ['hard'] }`; changeset/activity name the clamped ray start, `history: { from }` — the query's `from` limited to the granted ray (see [Permissions](#permissions)) | no — the grant must change first |
 | `403` with `code: 'origin-not-allowed'` | the page's origin is not allowed by `server.cors` (see [CORS](#cors)) — always json | no — fix the server's cors config, not the credentials |
 | `429` | rate limited — yhub itself never sends this; reserved for proxies and custom endpoints | yes — back off first |
-| `500`–`599` | server-side failure — `500` internal error, `503` a dependency (e.g. the auth backend) is temporarily down, or the compute queue is full (`code: 'compute-queue-full'`, see `computePool.maxQueue` in [`createYHub`](#createyhubconfig)) | yes |
+| `500`–`599` | server-side failure — `500` internal error (`code: 'internal-error'`), `503` the auth plugin failed (`code: 'auth-unavailable'`) or exceeded `server.authTimeout` (`code: 'auth-timeout'`), or the compute queue is full (`code: 'compute-queue-full'`, see `computePool.maxQueue` in [`createYHub`](#createyhubconfig)) | yes |
 
 ### JSON encoding
 
@@ -201,7 +201,7 @@ written.
   * `awareness`: optional awareness update bytes — the bare output of `encodeAwarenessUpdate(awareness, clientIds)` from `@y/protocols/awareness` (no `messageAwareness` wire-format prefix). Distributed to connected clients through the same Redis channel the WebSocket path uses.
   * `customAttributions`: optional array of key-value pairs to attach as custom attributions to the `update`'s changes. Stored as `insert:<key>` / `delete:<key>` attribution attributes alongside the standard ones. Has no effect when only `awareness` is supplied.
   * `branch="main"` (default): the branch to update
-  * At least one of `update` or `awareness` must be present; an empty body returns `400 Bad Request`.
+  * At least one of `update` or `awareness` must be present; an empty body returns `400 { code: 'invalid-body' }`.
   * Changes are distributed to connected WebSocket clients.
   * Returns `{ success: true, message: string }` on success.
   * The body is lib0-any-encoded by default; with `Content-Type: application/json` it is json with `update`/`awareness` as base64 strings (see [JSON encoding](#json-encoding)).
@@ -469,7 +469,7 @@ them, never clamp.
   * `by=string`: comma-separated list of user-ids that matches the attributions
   * `contentIds`: restrict pruning to the changes described by a `Y.ContentIds`
   * `withCustomAttributions`: only prune content whose attributions match all specified key-value pairs
-  * At least one filter is required; an empty body is rejected with `400`.
+  * At least one filter is required; an empty body is rejected with `400 { code: 'missing-filter' }`.
   * Returns `{ success: true }`.
 
 #### Example
@@ -870,7 +870,8 @@ any time, also after `await`s:
 Throw `apiError(status, message, extra?)` (exported by `@y/hub`) to respond with a specific status
 code and an any-encoded `{ error: message, ...extra }` body (json on `Accept: application/json`) —
 use `extra` for machine-readable fields, conventionally `{ code: 'comment-not-found' }`. Any other
-exception is logged and produces a generic `500` without leaking internals.
+exception is logged and produces a generic `500 { error: 'Internal server error', code: 'internal-error' }`
+without leaking internals.
 
 Pick the status by retry class (see [Errors](#errors)): `4xx` when the caller must change
 something first — the request (`400`/`422`), the target (`404`), the conflict (`409`) — `503`
@@ -1073,6 +1074,7 @@ const yhub = await createYHub(config)
 | `redis.clientOptions` | `object` | no | Additional options passed to the node-redis client, e.g. `{ pingInterval: 10000 }`. YHub still controls `url`; `redis.socket` is merged into the final socket config; `clientOptions.scripts` are merged with YHub's Lua scripts. |
 | `redis.socket` | `object` | no | Custom socket options merged into the Redis client socket config. See [node-redis socket options](https://github.com/redis/node-redis/blob/master/docs/client-configuration.md#socket-options) for available options. |
 | `postgres` | `string` | yes | PostgreSQL connection string |
+| `postgresOptions` | `object` | no | Options passed to the [postgres.js](https://github.com/porsager/postgres#connection-details) client, spread over yhub's `{ connect_timeout: 60 }`. Without a statement timeout, a query stuck on a wedged database holds a rest request or a websocket's initial sync forever — bound it with `connection: { statement_timeout: 30000 }` (milliseconds, a server-side parameter set on every connection; a statement that exceeds it fails with `57014`). It applies to every query, the worker's included, so keep it above the slowest legitimate one. `max` sizes the connection pool per process (default: `10`), `idle_timeout` closes connections idle for that many seconds (default: never). |
 | `persistence` | `PersistencePlugin[]` | yes | One or more storage plugins (e.g. `S3PersistenceV1`). At least one is required. |
 | `computePool` | `object` | no | The pool of worker threads that runs CPU-intensive Yjs work: merging, pruning, state vectors, changesets, activity and rollback. `yhub.computePool.stats()` returns `{ queued, busy, workers }`: tasks waiting for a thread, threads computing, live threads. |
 | `computePool.maxThreads` | `number` | no | Worker threads in the pool. Set this explicitly when the process is restricted to a subset of cores — `os.cpus().length` does not reflect `taskset` or cgroup limits. Default: number of cpus - 1 |
@@ -1086,6 +1088,7 @@ const yhub = await createYHub(config)
 | `server.apiPrefix` | `string` | no | First path segment under which all endpoints are served — built-in and custom rest endpoints plus the websocket route `/{apiPrefix}/ws/v1/...` — e.g. `'collaboration'` → `/collaboration/{name}/{version}/...`. A single path segment. Default: `'api'` |
 | `server.maxDocSize` | `number` | no | Maximum Ydoc size in bytes, used for WebSocket payload limits (`maxPayloadLength`, and `maxBackpressure` at 1.2x). Updates are never split across frames, so this must exceed the largest document — a client that sends a bigger frame is closed with 1009. Default: 500 MB |
 | `server.wsKeepAliveInterval` | `number \| null` | no | Milliseconds without a message to a client after which the server sends it an empty awareness message (zero entries — it carries no presence, so every connection gets it regardless of the awareness facet). Clients reconnect when they receive nothing for a while (`@y/websocket`: `socketTimeout`, 45 s), and websocket pings don't reach client code, so an idle document would reconnect-loop without it. `null` disables. Default: `20000` |
+| `server.authTimeout` | `number` | no | Milliseconds the auth plugin's `authenticate` and `authorize` may take. A hook that doesn't settle in time is abandoned: rest requests answer `503 { error: 'auth timeout', code: 'auth-timeout' }`, the websocket upgrade `503`, and a [re-check](#yhubrecheckauthdocref-opts) closes the live socket with `1013`. All three are transient, so clients retry. Must be finite: Node runs a delay above 2³¹−1 ms (about 24.8 days) after 1 ms, so `Infinity` would time out every call. Default: `10000` |
 | `server.maxVersionSize` | `number` | no | Maximum size of the client's part of a [named version](#versions) — the characters of its `name` plus the bytes of its lib0-any encoded `custom` data; larger writes answer `413`. Versions ride along in activity responses. Default: 64 KB |
 | `server.cors` | `object \| null` | no | Cross-origin resource sharing — see [CORS](#cors). **While this is unset, cross-origin browser access is closed**: no `Access-Control-*` header is sent, and cross-origin WebSocket upgrades and api requests are denied. Same-origin pages and non-browser clients are unaffected. |
 | `server.cors.origin` | `string \| string[]` | yes* | `'*'` for every origin, one origin, or an allowlist. An allowlist echoes back the request's `Origin` when it matches and sends `Vary: Origin`; a request from a non-matching origin is denied. An entry may start its host with `*.` — `https://*.example.com` matches every host under `example.com` but never the apex, and ports must be spelled out. Only wildcard a domain you own outright: `https://*.co.uk`-style public-suffix wildcards are accepted but allowlist every site under the suffix. |
@@ -1117,6 +1120,8 @@ const yhub = await createYHub({
     // socket: { rejectUnauthorized: false, ca: fs.readFileSync('/path/to/ca.pem', 'utf-8') }
   },
   postgres: 'postgres://user:pass@localhost/yhub',
+  // Optional: postgres.js client options, e.g. bound every statement.
+  // postgresOptions: { max: 20, idle_timeout: 60, connection: { statement_timeout: 30000 } },
   persistence: [
     new S3PersistenceV1({ bucket: 'my-bucket', /* ... */ })
   ],

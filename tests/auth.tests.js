@@ -9,6 +9,7 @@ import * as f from 'lib0/function'
 import * as time from 'lib0/time'
 import * as promise from 'lib0/promise'
 import * as buffer from 'lib0/buffer'
+import WebSocket from 'ws'
 import { apiError, wsCloseAuthRevoked } from '../src/index.js'
 import { matchesAuthInfo } from '../src/server.js'
 
@@ -107,6 +108,34 @@ await utils.createTestHub({
           if (entry === 'throw') throw new Error('auth backend down')
           if (entry === 'throw503') throw apiError(503, 'auth backend unavailable')
           return entry === undefined ? docPermissionsPreset('rw') : entry
+        }
+      })
+    })
+  }
+})
+
+const hangHubPort = utils.testHubPort(11)
+const hangAuthTimeout = 300
+/**
+ * The auth hook that never settles - null: both answer at once.
+ *
+ * @type {'authenticate'|'authorize'|null}
+ */
+let hangHook = null
+await utils.createTestHub({
+  worker: null,
+  server: {
+    port: hangHubPort,
+    authTimeout: hangAuthTimeout,
+    auth: types.createAuthPlugin({
+      async authenticate () {
+        if (hangHook === 'authenticate') await promise.create(() => {})
+        return { userid: 'user1' }
+      },
+      authorize: types.createAuthorize({
+        document: async () => {
+          if (hangHook === 'authorize') await promise.create(() => {})
+          return docPermissionsPreset('rw')
         }
       })
     })
@@ -333,7 +362,7 @@ export const testAuthPluginErrorClasses = async _tc => {
   kickPerms.eve = 'throw'
   const resThrow = await fetch(url)
   t.assert(resThrow.status === 503, 'an unbranded authorize error is a transient 503')
-  t.compare(buffer.decodeAny(new Uint8Array(await resThrow.arrayBuffer())), { error: 'authorize unavailable' })
+  t.compare(buffer.decodeAny(new Uint8Array(await resThrow.arrayBuffer())), { error: 'authorize unavailable', code: 'auth-unavailable' })
   // the jwt hub: a bad credential is rejected by the plugin's own branded 401, no credential is
   // an anonymous caller without a grant - 403
   const authUrl = `http://localhost:${authHubPort}/api/ydoc/v1/testOrg/anyDoc`
@@ -343,4 +372,42 @@ export const testAuthPluginErrorClasses = async _tc => {
   const resAnon = await fetch(authUrl)
   t.assert(resAnon.status === 403, 'an anonymous caller without permissions is denied, not unauthenticated')
   t.assert(buffer.decodeAny(new Uint8Array(await resAnon.arrayBuffer())).code === 'missing-permission')
+}
+
+/**
+ * A hung auth plugin is abandoned after `server.authTimeout`: rest requests and the websocket
+ * upgrade answer 503 `auth timeout`, a recheck closes a live socket with the transient 1013 - and
+ * the client recovers once the plugin answers again.
+ *
+ * @param {t.TestCase} tc
+ */
+export const testAuthTimeout = async tc => {
+  hangHook = null
+  const { createWsClient, yhub, defaultDocRef } = await utils.createTestCase(tc)
+  for (const hook of /** @type {const} */ (['authenticate', 'authorize'])) {
+    hangHook = hook
+    const start = time.getUnixTime()
+    const res = await fetch(`http://localhost:${hangHubPort}/api/ydoc/v1/testOrg/anyDoc`)
+    t.assert(res.status === 503, `a hung ${hook} answers 503`)
+    t.compare(buffer.decodeAny(new Uint8Array(await res.arrayBuffer())), { error: 'auth timeout', code: 'auth-timeout' })
+    t.assert(time.getUnixTime() - start < hangAuthTimeout + 2000, 'within the timeout')
+  }
+  const upgradeStatus = await promise.create(resolve => {
+    const ws = new WebSocket(`${utils.wsUrlFromPort(hangHubPort)}/anyDoc`)
+    ws.on('open', () => { ws.close(); resolve('open') })
+    ws.on('unexpected-response', (_req, res) => { ws.terminate(); resolve(`${res.statusCode}`) })
+    ws.on('error', () => resolve('error'))
+  })
+  t.assert(upgradeStatus === '503', 'a hung authorize answers the upgrade with 503')
+  hangHook = null
+  const client = await createWsClient({ waitForSync: true, wsUrl: utils.wsUrlFromPort(hangHubPort) })
+  /** @type {Array<number>} */
+  const closeCodes = []
+  recordCloseCodes(client.provider, closeCodes)
+  hangHook = 'authorize'
+  await yhub.recheckAuth(defaultDocRef)
+  await promise.until(hangAuthTimeout + 5000, () => closeCodes.includes(1013))
+  t.assert(!closeCodes.includes(wsCloseAuthRevoked), 'a hung auth plugin must not look like a revoke')
+  hangHook = null
+  await promise.until(5000, () => client.provider.wsconnected)
 }

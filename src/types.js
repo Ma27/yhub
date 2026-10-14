@@ -604,6 +604,12 @@ export const $config = s.$object({
     socket: /** @type {s.$Optional<s.Schema<import('@redis/client').RedisClientOptions['socket']>>} */ (s.$any.optional)
   }),
   postgres: s.$string,
+  /**
+   * Options passed to the postgres.js client, spread over yhub's `{ connect_timeout: 60 }` - e.g.
+   * `{ max: 20, idle_timeout: 60, connection: { statement_timeout: 30000 } }`. See API.md.
+   * @type {s.$Optional<s.Schema<import('postgres').Options<{}>>>}
+   */
+  postgresOptions: /** @type {s.$Optional<s.Schema<import('postgres').Options<{}>>>} */ (s.$any.optional),
   persistence: s.$array($persistencePlugin),
   /**
    * The pool of worker threads that runs CPU-intensive Yjs work (merging, pruning, state vectors,
@@ -693,6 +699,14 @@ export const $config = s.$object({
      * keep it small. (default: 64K)
      */
     maxVersionSize: s.$number.optional,
+    /**
+     * Milliseconds the auth plugin's `authenticate` and `authorize` may take. A hook that doesn't
+     * settle in time is abandoned: rest requests and the websocket upgrade answer 503
+     * `auth timeout`, a websocket recheck closes the connection with 1013. Must be finite - node
+     * runs a delay above 2^31-1 ms after 1 ms, so `Infinity` would time out every call.
+     * (default: 10000)
+     */
+    authTimeout: s.$number.optional,
     /**
      * Cross-origin resource sharing. While this is unset, no `Access-Control-*` header is sent
      * and cross-origin websocket upgrades and api requests are denied - only same-origin pages

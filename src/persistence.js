@@ -19,12 +19,13 @@ const log = logger.child({ module: 'persistence' })
 /**
  * @param {string} postgresUrl - postgres://username:password@host:port/database
  * @param {t.PersistencePlugin[]} plugins
+ * @param {import('postgres').Options<{}>} [postgresOptions] - spread over the defaults
  */
-export const createPersistence = async (postgresUrl, plugins) => {
+export const createPersistence = async (postgresUrl, plugins, postgresOptions) => {
   // parsed before connecting, so a malformed url fails here rather than inside the catch below
   const endpoint = describeUrl(postgresUrl)
   // If a specific database is requested, ensure it exists
-  const sql = postgres(postgresUrl, { connect_timeout: 60 })
+  const sql = postgres(postgresUrl, { connect_timeout: 60, ...postgresOptions })
   try {
     await sql`SELECT 1 as connected`
   } catch (err) {

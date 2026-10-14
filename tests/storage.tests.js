@@ -3,7 +3,10 @@ import * as t from 'lib0/testing'
 import * as types from '../src/types.js'
 import * as env from 'lib0/environment'
 import * as promise from 'lib0/promise'
+import * as time from 'lib0/time'
+import net from 'node:net'
 import { S3PersistenceV1 } from '@y/hub/plugins/s3'
+import { createPersistence } from '../src/persistence.js'
 import { yhub } from './utils.js'
 
 let currClock = 0
@@ -258,4 +261,46 @@ export const testS3DeleteDelay = async tc => {
   t.compare(await plugin.retrieve(assetId, ref), asset, 'the object is there before the delete')
   t.assert(await plugin.delete(assetId, ref), 'the erase was scheduled')
   await promise.untilAsync(async () => await plugin.retrieve(assetId, ref) === null, 5000)
+}
+
+/**
+ * `postgresOptions` reach the postgres client: a `statement_timeout` set via `connection` cancels
+ * a statement that runs longer.
+ *
+ * @param {t.TestCase} _tc
+ */
+export const testPostgresOptions = async _tc => {
+  const pers = await createPersistence(env.ensureConf('postgres-testing'), [], { max: 1, connection: { statement_timeout: 100 } })
+  try {
+    const err = await pers.sql`SELECT pg_sleep(1)`.then(() => null, err => err)
+    t.assert(err?.code === '57014', 'the statement was canceled by statement_timeout')
+  } finally {
+    await pers.destroy()
+  }
+}
+
+/**
+ * `requestTimeout` (default 60s) aborts a request whose socket goes quiet - the agent's `timeout`
+ * alone only emits an event that minio never listens for, so a store that accepts but never
+ * answers would hang the request forever.
+ *
+ * @param {t.TestCase} _tc
+ */
+export const testS3RequestTimeout = async _tc => {
+  /** @type {Array<net.Socket>} */
+  const sockets = []
+  const server = net.createServer(socket => { sockets.push(socket) })
+  await promise.create(resolve => server.listen(0, '127.0.0.1', () => resolve(undefined)))
+  try {
+    const port = /** @type {net.AddressInfo} */ (server.address()).port
+    t.assert(/** @type {any} */ (new S3PersistenceV1(s3TestConf())._agent).options.timeout === 60_000, 'the default')
+    const plugin = new S3PersistenceV1({ ...s3TestConf(), endPoint: '127.0.0.1', port, useSSL: false, requestTimeout: 200, retryDelay: 0 })
+    t.assert(/** @type {any} */ (plugin._agent).options.timeout === 200, 'the agent carries the timeout')
+    const start = time.getUnixTime()
+    await t.failsAsync(() => plugin.s3client.bucketExists(plugin.bucket))
+    t.assert(time.getUnixTime() - start < 2000, 'the hung request was aborted')
+  } finally {
+    sockets.forEach(socket => socket.destroy())
+    server.close()
+  }
 }

@@ -11,7 +11,7 @@ import { logger } from '../logger.js'
 const log = logger.child({ module: 's3' })
 
 /**
- * @typedef {{ bucket: string, endPoint: string, port: number, useSSL: boolean, accessKey: string, secretKey: string, enable?: boolean, branches?: true | Array<string>, deleteVersions?: boolean, retryDelay?: number, deleteDelay?: number }} S3Conf
+ * @typedef {{ bucket: string, endPoint: string, port: number, useSSL: boolean, accessKey: string, secretKey: string, enable?: boolean, branches?: true | Array<string>, deleteVersions?: boolean, retryDelay?: number, deleteDelay?: number, requestTimeout?: number }} S3Conf
  */
 
 export const $retrievableS3Asset = s.$object({
@@ -82,7 +82,17 @@ export class S3PersistenceV1 {
     this.retryDelay = s3conf.retryDelay ?? 1_000
     this.deleteDelay = s3conf.deleteDelay ?? 10_000
     const Agent = s3conf.useSSL ? https.Agent : http.Agent
-    this._agent = new Agent({ keepAlive: true, keepAliveMsecs: 30_000 })
+    // 0 disables the timeout - the socket then never emits 'timeout'
+    this._agent = new Agent({ keepAlive: true, keepAliveMsecs: 30_000, timeout: s3conf.requestTimeout ?? 60_000 })
+    // the agent's `timeout` only emits 'timeout' on an in-flight request, and minio never listens
+    // for it - the request would hang on. Destroying the socket rejects the request, or its
+    // response stream, with a transient error that `retryTransient` retries once.
+    const createConnection = this._agent.createConnection.bind(this._agent)
+    this._agent.createConnection = (opts, cb) => {
+      const socket = createConnection(opts, cb)
+      socket?.on('timeout', () => socket.destroy(Object.assign(new Error('s3 request timed out'), { code: 'ETIMEDOUT' })))
+      return socket
+    }
     this.s3client = new S3Client({ ...s3conf, transportAgent: this._agent, partSize: S3_PART_SIZE })
   }
 

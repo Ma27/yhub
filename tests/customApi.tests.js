@@ -296,14 +296,12 @@ export const testErrors = async tc => {
   await t.groupAsync('other exceptions produce a generic 500', async () => {
     const res = await fetch(base, { method: 'POST' })
     t.assert(res.status === 500)
-    const body = await decodeResponse(res)
-    t.assert(body.error === 'Internal server error')
+    t.compare(await decodeResponse(res), { error: 'Internal server error', code: 'internal-error' })
   })
   await t.groupAsync('foreign errors with a status property don\'t leak their message', async () => {
     const res = await fetch(base, { method: 'PUT' })
     t.assert(res.status === 500)
-    const body = await decodeResponse(res)
-    t.assert(body.error === 'Internal server error')
+    t.compare(await decodeResponse(res), { error: 'Internal server error', code: 'internal-error' })
   })
 }
 

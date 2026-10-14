@@ -10,7 +10,7 @@ import * as protocol from './protocol.js'
 import * as math from 'lib0/math'
 import * as time from 'lib0/time'
 import { createContentMap, mergeUpdates } from './y-utils.js'
-import { registerApi, resolveApiPrefix, resolvePermissions, normalizeAuthorizeAnswer, apiError, isApiError, statusLine } from './api.js'
+import { registerApi, resolveApiPrefix, resolvePermissions, normalizeAuthorizeAnswer, apiError, isApiError, statusLine, withAuthTimeout } from './api.js'
 import { originAllowed, resolveCors } from './cors.js'
 import { parseCustomAttributionsParam } from './builtin-api.js'
 import { endpointPermission } from './permissions.js'
@@ -331,11 +331,12 @@ export class WSUser {
    * it from the server). REST-only facets (`delete`, `history.rollback`/`prune`/`version`/`publish`, the other
    * `endpoint` entries) never bounce a live connection. Fails closed: an auth plugin error also
    * disconnects, but with the transient code 1013 instead of 4401 - the client keeps
-   * reconnecting and is re-checked at upgrade, so it recovers once the auth backend does.
+   * reconnecting and is re-checked at upgrade, so it recovers once the auth backend does. So does
+   * an answer that takes longer than `server.authTimeout`.
    */
   async recheckAuth () {
     try {
-      const answer = await this.yhub.conf.server?.auth.authorize('document', this.docRef, this.authInfo)
+      const answer = await withAuthTimeout(this.yhub, 'authorize', /** @type {import('./types.js').AuthPlugin<any>} */ (this.yhub.conf.server?.auth).authorize('document', this.docRef, this.authInfo))
       if (this.isDestroyed) return
       const p = normalizeAuthorizeAnswer('document', answer)
       const cur = this.permissions
