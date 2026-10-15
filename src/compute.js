@@ -43,7 +43,7 @@ const $computeTask = s.$union(
     includeDelta: s.$boolean,
     includeDiff: s.$boolean,
     includeAttributions: s.$boolean,
-    // the document's last-update clock in ms, passed through into the response
+    // the document's last-change clock in ms, passed through into the response
     t: s.$number
   }),
   s.$object({

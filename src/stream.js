@@ -262,7 +262,8 @@ export class Stream {
           SCRIPT: `
             -- KEYS[1]  the document's stream (encodeRoomName)
             -- KEYS[2]  the org's updated-documents zset (encodeDocUpdatedKey)
-            -- ARGV[1]  minId: the last persisted stream id - entries up to it may go
+            -- ARGV[1]  minId: the last stream id the worker processed (the persisted row covers every
+            --          content entry up to it) - entries up to it may go
             -- ARGV[2]  maxAgeMs: entries younger than this stay regardless (minMessageLifetime)
             -- ARGV[3]  the compact task id to ack, or "" for none
             -- ARGV[4]  the document's member in the zset (encodeDocUpdatedMember)
@@ -384,18 +385,18 @@ export class Stream {
   }
 
   /**
-   * The documents of `org` with live stream content whose last update has a stream clock in
+   * The documents of `org` with live stream content whose last change has a stream clock in
    * `[from, to]` (unix ms, inclusive), oldest first - see `encodeDocUpdatedKey`.
    *
    * @param {string} org
    * @param {object} range
    * @param {number} range.from
-   * @param {number} [range.to]
+   * @param {number} range.to
    * @param {number} [range.limit]
    * @return {Promise<Array<{ docid: string, branch: string, t: number }>>}
    */
   async getUpdatedDocs (org, { from, to, limit }) {
-    const members = await this.redis.zRangeWithScores(encodeDocUpdatedKey(org, this.prefix), from, to ?? '+inf', { BY: 'SCORE', ...(limit == null ? {} : { LIMIT: { offset: 0, count: limit } }) })
+    const members = await this.redis.zRangeWithScores(encodeDocUpdatedKey(org, this.prefix), from, to, { BY: 'SCORE', ...(limit == null ? {} : { LIMIT: { offset: 0, count: limit } }) })
     return members.map(({ value, score }) => ({ ...decodeDocUpdatedMember(value), t: score }))
   }
 

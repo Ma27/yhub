@@ -3,7 +3,7 @@
 > software!**
 
 y/hub is an alternative backend for y-websocket. It only requires a redis
-instance and a storage provider (S3 or Postgres-compatible).
+instance (6.2 or later, or Valkey) and a storage provider (S3 or Postgres-compatible).
 
 * **Memory efficient:** The server doesn't maintain a Y.Doc in-memory. It
 streams updates through redis. The Yjs document is only loaded to memory for the

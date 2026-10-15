@@ -286,7 +286,7 @@ the *attributions*, never the content.
   * `diff=true`: include **the change alone**, keyed by root type the way `Y.diffDocsToDelta` is: `{ type: 'delta', attrs: { [rootName]: { type: 'modify', value } } }` where each `value` is what `observeDeep` would report for that root over the window — `retain`/`insert`/`delete` for text and arrays, only the changed keys for maps (`setAttr`/`deleteAttr`), `modify` for nested types — positioned in the document as it stood at `to`. The unnamed root (`doc.get()`) is the key `''`. Content inserted *and* deleted inside the window is omitted, roots the change does not touch are absent, and the whole field is `null` when nothing in the window matches. This is what to filter on a path or range with ("tell me when this cell changes") without reading the document. Unlike `delta`, which renders the unnamed root only, `diff` covers every root type. Known gap in the renderer: a map key that is overwritten *and then deleted* within one window renders no `deleteAttr`.
   * `attributions=true`: include the attributions `ContentMap`.
   * Returns `{ t: number, ydoc?: Uint8Array, attributions?: Y.ContentMap, delta?: Delta, diff?: Delta|null }`, served as `application/x-lib0any` (json on `Accept: application/json`, binary fields as base64 — see [JSON encoding](#json-encoding)).
-    * `t` is always present: the document's **last-change clock**, the unix ms of the stream id of the last message that changed it (an update or a prune) — the same number the [updated documents](#updated-documents) listing reports. A poller stores it per document and passes it as the next `from`.
+    * `t` is always present: the document's **last-change clock**, the unix ms of the stream id of the last message that changed it (an update or a prune) — the same number the [updated documents](#updated-documents) listing reports. A poller stores it per document and passes it as the next `from`. A cached response (`redis.cacheTtl`) repeats the `t` it was computed with, so polling faster than the ttl can fetch a document once more than needed — never fewer times.
 
 The `ydoc` is the document at `to`; its alive content already *is* that point-in-time state, so you render its differences by applying it to a `gc: false` doc and overlaying the `attributions` with an `AttributionsRenderer` (see [Rendering with AttributionsRenderer](#rendering-with-attributionsrenderer)).
 
@@ -1230,11 +1230,12 @@ called `room` before 0.8.0.
 | Event | Payload | When |
 |---|---|---|
 | `taskStart` | `{ docRef, timestamp }` | A compaction task starts, before it reads anything. `timestamp` is unix milliseconds. |
-| `docUpdate` | the merged `DocTable` plus `docRef` | New content was merged and is about to be written. **Not** called for a task that finds nothing to persist and only trims the stream. |
+| `docUpdate` | the merged `DocTable` plus `docRef` | The document's clock moved — new content was merged, or a prune or a soft deletion changed it — and the row is about to be written. **Not** called for a task that finds nothing to persist and only trims the stream. |
 | `taskComplete` | `{ docRef, duration, error }` | The task finished. Fires from a `finally`, so it also covers trim-only passes and failures: `error` is the `Error` that aborted the task, or `null`. `duration` is milliseconds since the matching `taskStart` `timestamp`. |
 
-Not every `taskStart` is followed by a `docUpdate` — a task on a document with no new content
-takes the trim-only path — but every `taskStart` is followed by a `taskComplete`.
+Not every `taskStart` is followed by a `docUpdate` — a task on a document whose stream holds
+nothing that changes it (presence only, or content already persisted) takes the trim-only path —
+but every `taskStart` is followed by a `taskComplete`.
 
 `docUpdate` receives the same fields as [`yhub.getDoc`](#yhubgetdocdocref-include-opts) with
 `{ gc: true, nongc: true, contentmap: true, contentids: true }`, plus `docRef`: `gcDoc`,

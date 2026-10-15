@@ -65,12 +65,15 @@ const initTables = async sql => {
         PRIMARY KEY     (org,docid,branch)
     )
   `
-  // partial: the only non-key query shape is "what still needs purging", so the index stays
-  // proportional to pending deletions rather than to every deletion ever
+  // partial: "what still needs purging" is served by an index proportional to pending deletions
+  // rather than to every deletion ever
   await sql`
     CREATE INDEX IF NOT EXISTS yhub_ydoc_tombstones_v1_pending
     ON yhub_ydoc_tombstones_v1 (deleted_at) WHERE purged_at IS NULL
   `
+  // the updated-documents listing reports a deletion at its `deleted_at`, read per org - without
+  // this every page would read all of the org's tombstones, which are kept forever
+  await sql`CREATE INDEX IF NOT EXISTS yhub_ydoc_tombstones_v1_updated ON yhub_ydoc_tombstones_v1 (org, deleted_at)`
   // named versions: `t` is a unix ms point in the document's history, the primary key serves the
   // range scan of the version and activity endpoints. `custom` is the client's lib0-any encoded
   // data; `created_at`/`updated_at` are redis TIME, like the tombstones' `deleted_at`

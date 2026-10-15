@@ -408,9 +408,14 @@ export class Persistence {
   /**
    * The documents of `org` whose persisted state or deletion has a clock in `[from, to]` (unix
    * ms, inclusive), oldest first - the persisted half of the updated-documents listing. `created`
-   * is the stream clock of the last update a compaction persisted; a deletion is reported at its
+   * is the stream clock of the last change a compaction persisted; a deletion is reported at its
    * `deleted_at`. Rows are not deduplicated: a document appears twice while the row a compaction
    * superseded is still being deleted.
+   *
+   * Each branch orders and limits itself: the n smallest of the union are among the n smallest of
+   * each branch, and the planner (postgres 16) does not push a limit through a plain
+   * `UNION ALL ... ORDER BY ... LIMIT` - it would read every row of the org in range and sort
+   * them. With the inner limits each branch is an index scan that stops after n rows.
    *
    * @param {string} org
    * @param {object} range
@@ -420,14 +425,14 @@ export class Persistence {
    * @return {Promise<Array<{ docid: string, branch: string, t: number }>>}
    */
   async retrieveUpdatedDocs (org, { from, to, limit }) {
+    const lim = limit == null ? this.sql`` : this.sql`LIMIT ${limit}`
     const rows = await this.sql`
-      SELECT docid, branch, created AS t FROM yhub_ydoc_v1
-      WHERE org = ${org} AND created BETWEEN ${from} AND ${to}
+      (SELECT docid, branch, created AS t FROM yhub_ydoc_v1
+       WHERE org = ${org} AND created BETWEEN ${from} AND ${to} ORDER BY created ${lim})
       UNION ALL
-      SELECT docid, branch, deleted_at AS t FROM yhub_ydoc_tombstones_v1
-      WHERE org = ${org} AND deleted_at BETWEEN ${from} AND ${to}
-      ORDER BY t
-      ${limit == null ? this.sql`` : this.sql`LIMIT ${limit}`}
+      (SELECT docid, branch, deleted_at AS t FROM yhub_ydoc_tombstones_v1
+       WHERE org = ${org} AND deleted_at BETWEEN ${from} AND ${to} ORDER BY deleted_at ${lim})
+      ORDER BY t ${lim}
     `
     return rows.map(row => ({ docid: row.docid, branch: row.branch, t: number.parseInt(row.t) }))
   }

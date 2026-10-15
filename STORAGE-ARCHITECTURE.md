@@ -82,6 +82,8 @@ CREATE TABLE yhub_ydoc_v1 (
     contentids_is_reference boolean NOT NULL DEFAULT true,
     PRIMARY KEY     (org, docid, branch, t)
 );
+-- the updated-documents listing (`GET /updated`) reads an org's rows by `created`
+CREATE INDEX yhub_ydoc_v1_updated ON yhub_ydoc_v1 (org, created);
 ```
 
 The `_is_reference` markers let a reader that only wants the references — the purge — leave inline
@@ -129,11 +131,15 @@ CREATE TABLE yhub_ydoc_tombstones_v1 (
 );
 CREATE INDEX yhub_ydoc_tombstones_v1_pending
     ON yhub_ydoc_tombstones_v1 (deleted_at) WHERE purged_at IS NULL;
+CREATE INDEX yhub_ydoc_tombstones_v1_updated
+    ON yhub_ydoc_tombstones_v1 (org, deleted_at);
 ```
 
-Keyed by DocRef, like everything else — deletion is per branch. The partial index serves the only
-non-key query shape there is, a retention task asking what still needs purging, and so stays
-proportional to pending deletions rather than to every deletion ever.
+Keyed by DocRef, like everything else — deletion is per branch. The partial index serves a
+retention task asking what still needs purging, and so stays proportional to pending deletions
+rather than to every deletion ever. The second one serves the updated-documents listing
+(`GET /updated`), which reports a deletion at its `deleted_at` and reads an org's tombstones by
+that clock — tombstones are kept forever, so without it every page would read all of them.
 
 `hard` is what the compact worker branches on. The barrier lives in `Persistence.store`'s `INSERT`
 itself (`WHERE NOT EXISTS (.. AND d.hard)`), not in a check ahead of it: a compact task spends

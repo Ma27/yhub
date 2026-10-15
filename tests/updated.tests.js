@@ -101,8 +101,8 @@ const appendEdit = async (docRef, ydoc, edit) => {
 }
 
 /**
- * The index entry is written by an update, never by awareness, at the update's stream clock, and
- * it leaves with the stream.
+ * The index entry is written by a content message (an update, a prune), never by awareness, at
+ * that message's stream clock, and it leaves with the stream.
  *
  * @param {t.TestCase} tc
  */
@@ -117,7 +117,7 @@ export const testIndexFollowsTheStream = async tc => {
   await promise.wait(5)
   const t2 = await appendEdit(docRef, ydoc, () => ydoc.get().insert(5, ' world'))
   t.assert(t2 > t1 && await redis.zScore(indexKey, member) === t2, 'the score follows the last update')
-  t.compare(await yhub.stream.getUpdatedDocs(org, { from: t1 }), [{ docid: docRef.docid, branch: docRef.branch, t: t2 }])
+  t.compare(await yhub.stream.getUpdatedDocs(org, { from: t1, to: t2 }), [{ docid: docRef.docid, branch: docRef.branch, t: t2 }])
   await promise.wait(5)
   const t3 = stream.redisClockToMs(await yhub.stream.addMessage(docRef, { type: 'prune:v1', prune: Y.encodeIdSet(Y.createIdSet()) }))
   t.assert(t3 > t2 && await redis.zScore(indexKey, member) === t3, 'a prune changes the document too')
@@ -152,7 +152,7 @@ export const testUnquarantineKeepsIndexing = async tc => {
 
 /**
  * The protocol end to end on the shared hub: the fresh half lists documents the moment they are
- * written, pages end at millisecond boundaries and an empty page means caught up, the persisted
+ * written, pages end at millisecond boundaries and `next === since` means caught up, the persisted
  * half takes over after compaction with the same clocks (trailing awareness does not move them),
  * the changeset carries the same `t` and `diff=true` yields exactly the next change, and a
  * deletion is listed at its time with the document's fetch answering 404.
@@ -183,7 +183,7 @@ export const testUpdatedListing = async tc => {
     t.compare(p2.docs.map(d => d.docid), [bRef.docid])
     t.assert(p2.next === tb)
     const p3 = await list(`since=${p2.next}&limit=1`)
-    t.assert(p3.docs.length === 0 && p3.next === tb, 'an empty page: caught up')
+    t.assert(p3.docs.length === 0 && p3.next === tb, 'next === since: caught up')
   })
   t.assert((await get(`/changeset/v1/${org}/${bRef.docid}`)).body.t === tb, 'the changeset reports the same clock')
   // presence after the last edit must not count as an update - neither on the stream nor, after
