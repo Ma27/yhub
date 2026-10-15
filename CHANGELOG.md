@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.0]
 
 > **Upgrading:** `bin/server.js`, `bin/worker.js` and `bin/yhub.js` now shut down gracefully on
 > `SIGTERM`. A worker can take up to `SHUTDOWN_DRAIN_MS` (default 15 seconds) plus about 13
@@ -41,6 +41,15 @@
   - **`yhub.computePool.stats()`** returns `{ queued, busy, workers }`: tasks waiting, threads computing, live threads.
 
   ([API docs](API.md#createyhubconfig), [`src/compute.js`](src/compute.js))
+
+- **A hung auth plugin, database or object store no longer holds a request forever: `server.authTimeout`, `postgresOptions` and the S3 plugin's `requestTimeout`.** Previously an `authenticate`/`authorize` call that never settled held its rest request, websocket upgrade or re-check open indefinitely, a query stuck on a wedged database held a rest request or a websocket's initial sync, and an S3 request whose socket went silent held the compaction or initial sync that needed it. Now:
+  - **`server.authTimeout`** (default `10000`) bounds both auth hooks. A hook that doesn't settle in time is abandoned: rest requests answer `503 { error: 'auth timeout', code: 'auth-timeout' }`, the websocket upgrade `503`, and a re-check closes the live socket with `1013`. All three are transient, so clients retry. Raise it if your auth backend legitimately takes longer; it must stay finite.
+  - **`postgresOptions`** is passed to the postgres.js client, spread over yhub's `{ connect_timeout: 60 }`. yhub sets no statement timeout itself. Bound one with `connection: { statement_timeout: 30000 }` (milliseconds, set on every connection); it applies to every query, the worker's included, so keep it above the slowest legitimate one. `max` sizes the connection pool per process, `idle_timeout` closes idle connections.
+  - **`requestTimeout`** on `S3PersistenceV1` (default `60000`, `0` disables) aborts a request whose socket sends or receives nothing for that long. The abort is `ETIMEDOUT`, a transient error, so the request is retried once like any other transient failure. It bounds inactivity, not total duration: an upload or download that keeps making progress is never cut off. Idle keepalive sockets are closed after the same time.
+
+  ([API docs](API.md#createyhubconfig), [S3 plugin](README.md#s3-persistence-s3persistencev1), [`src/api.js`](src/api.js), [`src/persistence.js`](src/persistence.js), [`src/plugins/s3.js`](src/plugins/s3.js))
+
+- **More error responses carry a machine-readable `code`.** A `500` carries `code: 'internal-error'`, both the generic answer to an unhandled exception and the built-in `ydoc`/`changeset`/`activity` handlers' own, a failed auth plugin answers `503 { code: 'auth-unavailable' }`, a rollback or prune without a filter `400 { code: 'missing-filter' }`, and a ydoc `PATCH` with neither `update` nor `awareness` `400 { code: 'invalid-body' }`. ([API docs](API.md#errors), [`src/api.js`](src/api.js), [`src/builtin-api.js`](src/builtin-api.js))
 
 ### Performance
 
