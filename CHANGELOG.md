@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.1]
 
 > **Upgrading:** run `npm run start:init` (`bin/init-db.js`) before starting this version. It adds
 > two indexes, `yhub_ydoc_v1_updated` on `yhub_ydoc_v1 (org, created)` and
