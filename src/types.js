@@ -170,6 +170,16 @@ export const $message = s.$union($updateMessage, $awarenessMessage, $pruneMessag
  * @typedef {s.Unwrap<typeof $message>} Message
  */
 
+/**
+ * Whether a message of this type changes what a reader of the document gets: an update (content),
+ * a prune (history) or the document's deletion. The others - presence and auth checks - are
+ * transient: they matter while they are live and leave no trace in the document. The clock a
+ * document is persisted at and the updated-documents index count exactly these.
+ *
+ * @param {Message['type']} type
+ */
+export const isContentMessage = type => type === 'ydoc:update:v1' || type === 'prune:v1' || type === 'ydoc:tombstone:v1'
+
 export const $docRef = s.$object({ org: s.$string, docid: s.$string, branch: s.$string })
 
 /**
@@ -288,6 +298,7 @@ export const $task = $compactTask
  * @template {{ gc?: boolean, nongc?: boolean, contentmap?: boolean, references?: boolean, contentids?: boolean, awareness?: boolean }} [Include=any]
  * @typedef {import('lib0/ts').Prettify<{
  *   lastClock: string,
+ *   streamClock: string,
  *   lastPersistedClock: string,
  *   tombstone: Tombstone|null,
  *   gcDoc: IfHasConf<Include, 'gc', Uint8Array<ArrayBuffer>>,
@@ -461,7 +472,7 @@ export const createAuthorize = handlers => async (scope, resourceId, user) => (a
  * segments, e.g. '/:commentId'), `cors` (overrides `server.cors` for this endpoint - `null`
  * disables cors on it). Each method is defined as a `{ $query?, handler }` object - see
  * `ApiMethodDef`. Names of built-in endpoints (`ydoc`, `rollback`, `prune`, `changeset`,
- * `activity`, `version`, `ws`) are reserved and refused in any version - one name in the `endpoint`
+ * `activity`, `version`, `updated`, `ws`) are reserved and refused in any version - one name in the `endpoint`
  * permission facet must mean one route family (`ws` is the websocket route's entry: `r` opens
  * the socket, `u` admits doc updates over it).
  *

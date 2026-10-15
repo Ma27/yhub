@@ -119,8 +119,8 @@ export const testAwarenessDisconnectDeliveredOnConnect = async tc => {
 
 /**
  * A document that only ever receives awareness messages must NOT be persisted. Awareness carries
- * no document content, so it must not advance the compaction guard (which now compares against
- * `lastUpdateClock`, not the awareness-inclusive `lastClock`). The stream is still trimmed and
+ * no document content, so it must not advance the compaction guard (which compares the clock of
+ * the last content message, not the awareness-inclusive `streamClock`). The stream is still trimmed and
  * cleaned up once the awareness entries age past `minMessageLifetime`.
  *
  * @param {t.TestCase} tc

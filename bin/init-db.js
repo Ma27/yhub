@@ -24,7 +24,11 @@ const initTables = async sql => {
         org             text,
         docid           text,
         branch          text,
+        -- the last persisted update clock: the redis stream id of the last message that changed the
+        -- document (an update, a prune, or the deletion's tombstone) this row persists - stream entries
+        -- up to it are in the row, presence after it does not move it
         t               text,
+        -- the millisecond part of t: the document's last-change clock, as GET /updated reports it
         created         INT8,
         gcDoc           bytea,
         nongcDoc        bytea,
@@ -46,6 +50,9 @@ const initTables = async sql => {
   await sql`ALTER TABLE yhub_ydoc_v1 ADD COLUMN IF NOT EXISTS nongcDoc_is_reference boolean NOT NULL DEFAULT true`
   await sql`ALTER TABLE yhub_ydoc_v1 ADD COLUMN IF NOT EXISTS contentmap_is_reference boolean NOT NULL DEFAULT true`
   await sql`ALTER TABLE yhub_ydoc_v1 ADD COLUMN IF NOT EXISTS contentids_is_reference boolean NOT NULL DEFAULT true`
+  // the updated-documents listing (`GET /updated`) reads an org's rows by `created` - the stream
+  // clock of the last persisted update - so "updated since" is one index range per org
+  await sql`CREATE INDEX IF NOT EXISTS yhub_ydoc_v1_updated ON yhub_ydoc_v1 (org, created)`
   await sql`
     CREATE TABLE IF NOT EXISTS yhub_ydoc_tombstones_v1 (
         org             text,

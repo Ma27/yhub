@@ -106,6 +106,67 @@ export const testRollback = async _tc => {
 }
 
 /**
+ * `changeset` with `includeDiff`: the change alone, per root type, as `observeDeep` reports it -
+ * what a poller of the updated-documents listing consumes. Rendered against the document as it
+ * stood at `to`, so a deletion after the window does not turn an in-window insert into a `delete`.
+ *
+ * @param {t.TestCase} _tc
+ */
+export const testChangesetDiff = async _tc => {
+  const pool = createComputePool({ maxThreads: 2 })
+  const doc = new Y.Doc({ gc: false })
+  /**
+   * Apply `edit` and stamp what it inserted and deleted with `at`.
+   *
+   * @param {number} at
+   * @param {() => void} edit
+   */
+  const stamp = (at, edit) => {
+    const before = Y.createContentIdsFromUpdate(Y.encodeStateAsUpdate(doc))
+    edit()
+    return Y.createContentMapFromContentIds(
+      Y.excludeContentIds(Y.createContentIdsFromUpdate(Y.encodeStateAsUpdate(doc)), before),
+      [Y.createContentAttribute('insert', 'user1'), Y.createContentAttribute('insertAt', at)],
+      [Y.createContentAttribute('delete', 'user1'), Y.createContentAttribute('deleteAt', at)]
+    )
+  }
+  const contentmapBin = Y.encodeContentMap(Y.mergeContentMaps([
+    stamp(1000, () => { doc.get().insert(0, 'hi'); doc.get('text').insert(0, 'hello'); doc.get('map').setAttr('k', 'v0'); doc.get('map').setAttr('other', 1) }),
+    stamp(2000, () => { doc.get().insert(2, ' there'); doc.get('text').insert(5, ' world'); doc.get('map').setAttr('k', 'v1') }),
+    stamp(3000, () => { doc.get('text').delete(0, 6) }),
+    stamp(4000, () => { doc.get('text').insert(0, 'churn'); doc.get('text').delete(0, 5) }),
+    stamp(5000, () => { doc.get('map').deleteAttr('k') })
+  ]))
+  const nongcDoc = Y.encodeStateAsUpdate(doc)
+  /**
+   * @param {number|null} from
+   * @param {number|null} to
+   * @return {Promise<{ t: number, diff: any }>}
+   */
+  const changeset = async (from, to) => decoding.readAny(decoding.createDecoder(await pool.changeset({ nongcDoc, contentmapBin, from, to, by: '', withCustomAttributions: null, includeYdoc: false, includeDelta: false, includeDiff: true, includeAttributions: false, t: 42 })))
+  const second = await changeset(1500, 2500)
+  t.assert(second.t === 42, 'the given last-update clock rides along')
+  t.compare(second.diff, delta.create()
+    .modifyAttr('', delta.create().retain(2).insert(' there').done())
+    .modifyAttr('text', delta.create().retain(5).insert(' world').done())
+    .modifyAttr('map', delta.create().setAttr('k', 'v1').done())
+    .done().toJSON(), 'every root the edit touched, nothing else - the later deletions do not show')
+  t.compare((await changeset(2500, 3500)).diff, delta.create().modifyAttr('text', delta.create().delete(6).done()).done().toJSON(), 'a deletion, in the root it touched only')
+  t.assert((await changeset(3500, 4500)).diff === null, 'content inserted and deleted inside the window is nothing')
+  t.compare((await changeset(4500, 5500)).diff, delta.create().modifyAttr('map', delta.create().deleteAttr('k').done()).done().toJSON())
+  // across the whole span: `hello` is deleted, the churned space never shows, and the map's `k`
+  // renders as nothing - overwritten and then deleted inside one window is the renderer's known
+  // gap (no `deleteAttr`), documented in API.md
+  t.compare((await changeset(1500, 5500)).diff, delta.create()
+    .modifyAttr('', delta.create().retain(2).insert(' there').done())
+    .modifyAttr('text', delta.create().delete(5).insert('world').done())
+    .modifyAttr('map', delta.create().done())
+    .done().toJSON())
+  doc.destroy()
+  await pool.destroy()
+}
+
+/**
  * @param {t.TestCase} _tc
  */
 export const testActivityGrouping = async _tc => {

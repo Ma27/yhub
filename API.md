@@ -272,19 +272,21 @@ Visualize attributed changes using either pure deltas or by retrieving the
 before and after state of a Yjs doc. Optionally, include relevant attributions.
 
 Access: the `history` facet — `from` is silently clamped to the granted ray
-(`max(query.from, history.from)`). `?ydoc=true`/`?delta=true` additionally require ydoc `r`: the
-rendered snapshot reconstructs the document from before any ray, so the ray bounds the
-*attributions*, never the content.
+(`max(query.from, history.from)`). `?ydoc=true`/`?delta=true`/`?diff=true` additionally require
+ydoc `r`: the rendered snapshot reconstructs the document from before any ray, so the ray bounds
+the *attributions*, never the content.
 
-* `GET /api/changeset/v1/{org}/{docid}` parameters: `{ from?: number, to?: number, by?: string, ydoc?: boolean, contentIds?: Y.ContentIds, delta?: boolean, attributions?: boolean, withCustomAttributions?: string }`
+* `GET /api/changeset/v1/{org}/{docid}` parameters: `{ from?: number, to?: number, by?: string, ydoc?: boolean, contentIds?: Y.ContentIds, delta?: boolean, diff?: boolean, attributions?: boolean, withCustomAttributions?: string }`
   * `from`/`to`: unix timestamp range filter — non-negative integers (`400` otherwise); `to` is lifted to the clamped `from`, so it never lies below the granted ray
   * `by=string`: comma-separated list of user-ids that matches the attributions
   * `withCustomAttributions=string`: filter by custom attributions using `key:value` pairs, comma-separated (e.g. `source:import,tag:v2`). Only changes matching all specified attributions are included.
   * `contentIds`: Changeset that describes the changes between two versions. @todo not implemented
   * `ydoc=true`: include the encoded document **as it was at `to`** — a single partially garbage-collected Yjs update. Deleted content outside the attribution window is gc'd; in-range deletes are kept restorable.
   * `delta=true`: include the delta representation — the document at `to` with the in-range attributions highlighted.
+  * `diff=true`: include **the change alone**, keyed by root type the way `Y.diffDocsToDelta` is: `{ type: 'delta', attrs: { [rootName]: { type: 'modify', value } } }` where each `value` is what `observeDeep` would report for that root over the window — `retain`/`insert`/`delete` for text and arrays, only the changed keys for maps (`setAttr`/`deleteAttr`), `modify` for nested types — positioned in the document as it stood at `to`. The unnamed root (`doc.get()`) is the key `''`. Content inserted *and* deleted inside the window is omitted, roots the change does not touch are absent, and the whole field is `null` when nothing in the window matches. This is what to filter on a path or range with ("tell me when this cell changes") without reading the document. Unlike `delta`, which renders the unnamed root only, `diff` covers every root type. Known gap in the renderer: a map key that is overwritten *and then deleted* within one window renders no `deleteAttr`.
   * `attributions=true`: include the attributions `ContentMap`.
-  * Returns `{ ydoc?: Uint8Array, attributions?: Y.ContentMap, delta?: Delta }`, served as `application/x-lib0any` (json on `Accept: application/json`, binary fields as base64 — see [JSON encoding](#json-encoding)).
+  * Returns `{ t: number, ydoc?: Uint8Array, attributions?: Y.ContentMap, delta?: Delta, diff?: Delta|null }`, served as `application/x-lib0any` (json on `Accept: application/json`, binary fields as base64 — see [JSON encoding](#json-encoding)).
+    * `t` is always present: the document's **last-change clock**, the unix ms of the stream id of the last message that changed it (an update or a prune) — the same number the [updated documents](#updated-documents) listing reports. A poller stores it per document and passes it as the next `from`.
 
 The `ydoc` is the document at `to`; its alive content already *is* that point-in-time state, so you render its differences by applying it to a `gc: false` doc and overlaying the `attributions` with an `AttributionsRenderer` (see [Rendering with AttributionsRenderer](#rendering-with-attributionsrenderer)).
 
@@ -359,7 +361,71 @@ res.activity.forEach(entry => {
 ```
 
 When `delta=true`, the server performs exactly this rendering and returns the result as
-`changeset.delta` / `entry.delta`.
+`changeset.delta` / `entry.delta`. The changeset's `diff=true` is the other rendering: not the
+document with the changes highlighted, but the change alone, as `observeDeep` would report it.
+
+### Updated documents
+
+Which documents of an org changed, and when — the trigger for anything that reacts to edits
+(automations, agents, search indexers, a "recently edited" list). Everything else yhub emits is
+tied to compaction and therefore up to `redis.taskDebounce` late; this listing sees a write the
+moment it is appended, on every write path (websocket, `PATCH /ydoc`, agents), once for the whole
+fleet, and for documents nobody has open.
+
+Access: the org `endpoint` facet (`endpoint.updated` `r` in the `permissions:org:v1` answer),
+**plus** ydoc `r` per listed document — the endpoint asks `authorize('document', …)` for every
+candidate and lists only the documents the caller may read. That is one `authorize` call per
+listed document per page, so the auth plugin is expected to answer cheaply (see
+[Contracts](#contracts)). A failing plugin fails the request with `503` rather than dropping documents.
+
+* `GET /api/updated/v1/{org}` parameters: `{ since?: number, limit?: number }`
+  * `since=number`: unix ms, exclusive — documents whose last change is after it (default: `0`, everything)
+  * `limit=number`: page size, `1`–`1000` (default: `100`). Soft: a page never splits a millisecond, so it runs past `limit` when more documents changed in the millisecond at its end
+  * Returns `{ docs: Array<{ docid: string, branch: string, t: number }>, next: number }`, oldest first. `t` is the document's **last-change clock** — the unix ms of the stream id of the last message that changed it: an update, a prune, or its deletion — the same number [changeset](#changeset) returns as `t`. `next` is the cursor for the following page (the last `t`, or `since` when nothing changed after it). Served as `application/x-lib0any` (json on `Accept: application/json`).
+
+**Paging and polling.** Request `since=next` until `next` comes back equal to the `since` you sent
+(caught up), then poll again later with that cursor. A page can be empty while `next` advanced —
+every document on it was one the caller may not read — so the cursor, not the page, says when you
+are done. A page ends before the current millisecond, so a write that lands while you read is on
+the next page, never behind the cursor. A document updated while you page moves forward and comes
+back a second time: **a document may be listed more than once, never missed**. Dedupe by
+`docid`/`branch` and keep the newest `t`.
+
+**The consumer loop.** The listing says *that* and *when*; the per-document apis say *what*. Store
+`next` as your cursor and `t` per document in your own database:
+
+```js
+const { docs, next } = await get(`/api/updated/v1/${org}?since=${cursor}`)
+for (const { docid, branch, t } of docs) {
+  const key = `${docid}/${branch}`
+  if (t > (known[key] ?? -1)) {
+    const res = await get(`/api/changeset/v1/${org}/${docid}?branch=${branch}&from=${known[key] ?? 0}&diff=true`)
+    known[key] = res.t // the changeset's own view of the last change - never behind the listing's
+    react(res.diff) // or res.delta / res.ydoc - see Changeset
+  }
+}
+cursor = next
+```
+
+Debouncing, rate limits and retries are yours: the cursor only moves when you say so, so a crash
+or a slow consumer replays, never skips. A deleted document is listed at its deletion time and its
+fetch answers `404 { code: 'doc-deleted' }` — that is how a poller learns of a deletion. A restored
+document (`yhub.restoreDoc`) is not listed until its next edit.
+
+**Clocks.** `t` and `since` are stream clocks (redis time). The changeset and activity filters
+`from`/`to` compare against the attribution timestamps, which the server that accepted a write
+stamps with its *own* clock just before appending it. An update appended after your stored `t`
+can therefore carry a timestamp slightly below it — clock skew between servers, or the moment
+between stamping and appending — and `from = t` would leave it out. Subtract an allowance from
+`from` (a second plus your servers' skew) when a missed change is worse than seeing one twice.
+
+**Where the data comes from.** Changes still on a document's redis stream are indexed in
+`{prefix}:doc_updated:{<org>}` (the braces around the org are literal, a redis cluster hash tag), a
+zset the write script maintains whose members live exactly as long as the stream. Once compaction
+has persisted and trimmed them, `yhub_ydoc_v1.created` — the clock of the last persisted change —
+and `yhub_ydoc_tombstones_v1.deleted_at` answer instead. Both halves are read on every request and
+merged, which is why a document can appear twice. The updates of a quarantined stream are in
+neither until they are re-injected.
 
 ### Versions
 
@@ -518,7 +584,7 @@ await prune({ from: activity[i].from, to: activity[j].to })
 Define your own rest endpoints — served from the same process and guarded by the same auth plugin
 as the built-in endpoints — via the `server.api` config section. Every endpoint — built-in and
 custom — lives under `/{apiPrefix}/{name}/{version}/...`. The built-in endpoint names (`ydoc`,
-`rollback`, `prune`, `changeset`, `activity`, `version`, plus `ws` — the websocket route's own entry in the
+`rollback`, `prune`, `changeset`, `activity`, `version`, `updated`, plus `ws` — the websocket route's own entry in the
 facet) are **refused for custom endpoints in any version**: one name in the `endpoint` permission
 facet must mean one route family (see [Permissions](#permissions)), and a custom route squatting a builtin name
 would blur what an `endpoint: { ydoc: ... }` grant covers — registration throws at startup. The prefix defaults
@@ -803,6 +869,11 @@ one lookup that isn't a single char compare.
   `503` on rest requests and the websocket upgrade, `1013` on a websocket re-check — never
   throw to deny. A branded `apiError` passes its status through: `apiError(401, ...)` from
   `authenticate` rejects a credential, `apiError(503, ...)` from either hook signals an outage.
+* **Cost**: yhub treats `authorize` as cheap and calls it liberally — once per rest request and
+  websocket upgrade, on every re-check, and once *per listed document* on
+  [`GET /updated`](#updated-documents). Answer from memory where you can: a server token with
+  root access should resolve to a constant, and a plugin that consults a remote authority should
+  cache per `(scope, resourceId, user)` for the lifetime of its grants.
 * **Anonymous callers**: `authenticate` answering `null` is not a rejection — it is an anonymous
   caller, and `authorize` is asked with `user: null` like for anyone else (public documents are a
   `document` handler that grants on `null`). yhub itself never answers `401` for missing
@@ -1088,7 +1159,7 @@ const yhub = await createYHub(config)
 | `server.apiPrefix` | `string` | no | First path segment under which all endpoints are served — built-in and custom rest endpoints plus the websocket route `/{apiPrefix}/ws/v1/...` — e.g. `'collaboration'` → `/collaboration/{name}/{version}/...`. A single path segment. Default: `'api'` |
 | `server.maxDocSize` | `number` | no | Maximum Ydoc size in bytes, used for WebSocket payload limits (`maxPayloadLength`, and `maxBackpressure` at 1.2x). Updates are never split across frames, so this must exceed the largest document — a client that sends a bigger frame is closed with 1009. Default: 500 MB |
 | `server.wsKeepAliveInterval` | `number \| null` | no | Milliseconds without a message to a client after which the server sends it an empty awareness message (zero entries — it carries no presence, so every connection gets it regardless of the awareness facet). Clients reconnect when they receive nothing for a while (`@y/websocket`: `socketTimeout`, 45 s), and websocket pings don't reach client code, so an idle document would reconnect-loop without it. `null` disables. Default: `20000` |
-| `server.authTimeout` | `number` | no | Milliseconds the auth plugin's `authenticate` and `authorize` may take. A hook that doesn't settle in time is abandoned: rest requests answer `503 { error: 'auth timeout', code: 'auth-timeout' }`, the websocket upgrade `503`, and a [re-check](#yhubrecheckauthdocref-opts) closes the live socket with `1013`. All three are transient, so clients retry. Must be finite: Node runs a delay above 2³¹−1 ms (about 24.8 days) after 1 ms, so `Infinity` would time out every call. Default: `10000` |
+| `server.authTimeout` | `number` | no | Milliseconds the auth plugin's `authenticate` and `authorize` may take. A hook that doesn't settle in time is abandoned: rest requests answer `503 { error: 'auth timeout', code: 'auth-timeout' }`, the websocket upgrade `503`, and a [re-check](#yhubrecheckauthdocref-opts) closes the live socket with `1013`. All three are transient, so clients retry. The timeout applies per call — a request that issues several ([`GET /updated`](#updated-documents) asks `authorize` once per listed document) can take several. Must be finite: Node runs a delay above 2³¹−1 ms (about 24.8 days) after 1 ms, so `Infinity` would time out every call. Default: `10000` |
 | `server.maxVersionSize` | `number` | no | Maximum size of the client's part of a [named version](#versions) — the characters of its `name` plus the bytes of its lib0-any encoded `custom` data; larger writes answer `413`. Versions ride along in activity responses. Default: 64 KB |
 | `server.cors` | `object \| null` | no | Cross-origin resource sharing — see [CORS](#cors). **While this is unset, cross-origin browser access is closed**: no `Access-Control-*` header is sent, and cross-origin WebSocket upgrades and api requests are denied. Same-origin pages and non-browser clients are unaffected. |
 | `server.cors.origin` | `string \| string[]` | yes* | `'*'` for every origin, one origin, or an allowlist. An allowlist echoes back the request's `Origin` when it matches and sends `Vary: Origin`; a request from a non-matching origin is denied. An entry may start its host with `*.` — `https://*.example.com` matches every host under `example.com` but never the apex, and ports must be spelled out. Only wildcard a domain you own outright: `https://*.co.uk`-style public-suffix wildcards are accepted but allowlist every site under the suffix. |
@@ -1167,9 +1238,10 @@ takes the trim-only path — but every `taskStart` is followed by a `taskComplet
 
 `docUpdate` receives the same fields as [`yhub.getDoc`](#yhubgetdocdocref-include-opts) with
 `{ gc: true, nongc: true, contentmap: true, contentids: true }`, plus `docRef`: `gcDoc`,
-`nongcDoc`, `contentmap` and `contentids` are populated, `lastClock` / `lastPersistedClock`
-bracket what this compaction is persisting, and `tombstone` is set when the document is
-soft-deleted. `references` and `awareness` are always `null` — the worker resolves references for
+`nongcDoc`, `contentmap` and `contentids` are populated, `lastPersistedClock` / `lastClock`
+bracket what this compaction is persisting (the row is written at `lastClock`; `streamClock` is
+the stream's last entry, awareness included, and is what gets trimmed), and `tombstone` is set
+when the document is soft-deleted. `references` and `awareness` are always `null` — the worker resolves references for
 its own bookkeeping and does not expose them here.
 
 The callbacks are invoked synchronously and their return value is ignored, so an `async` callback
@@ -1253,8 +1325,9 @@ yhub.getDoc(
   contentids: Uint8Array | null,
   references: Array<{ assetId, asset }> | null,
   awareness: Uint8Array | null,
-  lastClock: string,
-  lastPersistedClock: string
+  lastClock: string,         // the last message that changed the document (an update, a prune, its deletion) - what compaction persists at, the listing's `t`
+  streamClock: string,       // the stream's last entry of any kind, presence included - where a subscriber resumes
+  lastPersistedClock: string // the clock of the persisted rows
 }>
 ```
 

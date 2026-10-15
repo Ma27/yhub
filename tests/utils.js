@@ -29,7 +29,7 @@ const yhubPort = number.parseInt(env.getConf('test-port') || '4424')
  * Port for an additional test hub. Every test that spins up its own hub must use a distinct
  * `n`, so that concurrent test runs in other worktrees never collide.
  *
- * @param {number} n - 1-10, -1 or -2
+ * @param {number} n - 1-12, -1 or -2
  */
 export const testHubPort = n => yhubPort + n
 
@@ -209,6 +209,11 @@ export const yhub = await createYHub({
   const qKeys = await redis.keys(`${yhub.stream.prefix}:quarantine_room:*`)
   if (qKeys.length > 0) {
     await redis.del(qKeys)
+  }
+  // the streams above were deleted without their trim script, so their index members stay behind
+  const updatedKeys = await redis.keys(`${yhub.stream.prefix}:doc_updated:*`)
+  if (updatedKeys.length > 0) {
+    await redis.del(updatedKeys)
   }
   await redis.del(yhub.stream.compactionDisabledSetName)
   try {

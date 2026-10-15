@@ -481,6 +481,7 @@ export const testHistoryClampAndContentLeak = async tc => {
     // satisfies that half, the ydoc-read half is what refuses
     t.compare((await decodeResponse(leak)).required, docPerms({ history: { from: mid }, ydoc: '-r--' }))
     t.assert((await enfFetch(`/changeset/v1/${org}/${tc.testName}-index?delta=true`, 'auditor')).status === 403)
+    t.assert((await enfFetch(`/changeset/v1/${org}/${tc.testName}-index?diff=true`, 'auditor')).status === 403)
     t.assert((await enfFetch(`${activity}&ydoc=true`, 'historian')).status === 200)
   })
 }

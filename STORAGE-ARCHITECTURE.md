@@ -65,8 +65,12 @@ CREATE TABLE yhub_ydoc_v1 (
     org             text,
     docid           text,
     branch          text,
-    t               text,       -- redis identifier (timestamp)
-    created         INT8,       -- Unix timestamp in milliseconds
+    t               text,       -- the last persisted update clock: the redis stream id of the last
+                                -- message that changed the document (an update, a prune, or the
+                                -- deletion's tombstone) this row persists; presence after it does
+                                -- not move it
+    created         INT8,       -- the millisecond part of `t` - the document's last-change clock,
+                                -- as `GET /updated` reports it
     gcDoc           bytea,      -- Garbage-collected Y.js update
     nongcDoc        bytea,      -- Non-garbage-collected Y.js update
     contentmap      bytea,      -- Content map binary

@@ -41,7 +41,10 @@ const $computeTask = s.$union(
     withCustomAttributions: s.$array(s.$object({ k: s.$string, v: s.$string })).nullable,
     includeYdoc: s.$boolean,
     includeDelta: s.$boolean,
-    includeAttributions: s.$boolean
+    includeDiff: s.$boolean,
+    includeAttributions: s.$boolean,
+    // the document's last-update clock in ms, passed through into the response
+    t: s.$number
   }),
   s.$object({
     type: s.$literal('activity'),
@@ -390,7 +393,9 @@ class ComputePool {
    * @param {Array<{k: string, v: string}>|null} opts.withCustomAttributions
    * @param {boolean} opts.includeYdoc
    * @param {boolean} opts.includeDelta
+   * @param {boolean} opts.includeDiff
    * @param {boolean} opts.includeAttributions
+   * @param {number} opts.t
    * @param {Object<string, any>} [logContext]
    * @returns {Promise<Uint8Array<ArrayBuffer>>}
    */

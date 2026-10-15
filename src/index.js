@@ -53,6 +53,20 @@ const purgeDoc = async (yhub, docRef) => {
 }
 
 /**
+ * The clock of the last message in `messages` that changed the document (see `isContentMessage`),
+ * or `base` when none did - never below `base`, which is the clock the persisted rows carry.
+ *
+ * @param {Array<t.Message & { redisClock: string }>} messages - in clock order
+ * @param {string} base
+ */
+const lastContentClock = (messages, base) => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (t.isContentMessage(messages[i].type)) return strm.maxRedisClock(base, messages[i].redisClock)
+  }
+  return base
+}
+
+/**
  * @template {t.YHubConfig} [Conf=t.YHubConfig]
  */
 export class YHub {
@@ -205,21 +219,18 @@ export class YHub {
       taskLog.info('task started')
       // cheap pre-check: pull the stream and the persisted clock (no ydoc blobs, no S3) so
       // we can skip the expensive fetch+merge when there is nothing new to persist. only
-      // update/prune messages change the document and advance lastUpdateClock.
+      // content messages change the document and advance its clock.
       const [cachedMessages, persisted] = await promise.all([
         this.stream.getMessages([{ docRef: task.docRef, clock: '0' }]).then(ms => ms[0] || { messages: [], lastClock: '0' }),
         this.persistence.retrieveDoc(task.docRef, {})
       ])
-      const lastUpdateClock = cachedMessages.messages.reduce(
-        (clk, m) => (m.type === 'ydoc:update:v1' || m.type === 'prune:v1') ? strm.maxRedisClock(clk, m.redisClock) : clk,
-        persisted.lastClock
-      )
+      const lastClock = lastContentClock(cachedMessages.messages, persisted.lastClock)
       // a hard-deleted document is never persisted again - its content is thrown away and its
       // stream trimmed down to nothing. `store` refuses it regardless (that guard is what
       // closes the race against a merge that is already running); skipping here only
       // avoids doing the work. A soft-deleted document compacts normally, so whatever is on
       // the stream is persisted before it is trimmed away.
-      if (persisted.tombstone?.hard || !strm.isSmallerRedisClock(persisted.lastClock, lastUpdateClock)) {
+      if (persisted.tombstone?.hard || !strm.isSmallerRedisClock(persisted.lastClock, lastClock)) {
         taskLog.debug('nothing to compact, trimming only')
         // a hard-deleted document drains in this one pass: with maxAgeMs 0 the lua trims
         // everything, finds the stream empty, DELs the key and the task is already acked.
@@ -237,14 +248,17 @@ export class YHub {
       // the document. There is nothing new to write in that case, so only trim.
       if (!strm.isSmallerRedisClock(d.lastPersistedClock, d.lastClock)) {
         taskLog.warn('another worker persisted this document while we were computing, trimming only')
-        await this.stream.trimMessages(task.docRef, d.lastClock, this.stream.minMessageLifetime, task.redisClock)
+        await this.stream.trimMessages(task.docRef, d.streamClock, this.stream.minMessageLifetime, task.redisClock)
         return
       }
       this.conf.worker?.events?.docUpdate?.(object.assign({}, d, { references: null, docRef: task.docRef }))
+      // the row is keyed by `lastClock`, the last content message: trailing awareness must not
+      // move `created`, which the updated-documents listing reports as the document's last
+      // change. The trim uses `streamClock`, the stream's last entry - that awareness has to go too.
       await this.persistence.store(task.docRef, d)
       await promise.all([
         this.persistence.deleteReferences(d.references),
-        this.stream.trimMessages(task.docRef, d.lastClock, this.stream.minMessageLifetime, task.redisClock)
+        this.stream.trimMessages(task.docRef, d.streamClock, this.stream.minMessageLifetime, task.redisClock)
       ])
       taskLog.info({ gcDocSize: d.gcDoc?.byteLength, nongcDocSize: d.nongcDoc?.byteLength, refsDeleted: d.references?.length ?? 0 }, 'task completed')
     } catch (e) {
@@ -317,7 +331,11 @@ export class YHub {
     const contentids = /** @type {Array<Uint8Array>} */ (persistedDoc.contentids).map(Y.decodeContentIds)
     const references = persistedDoc.references
     const awareness = /** @type {Include['awareness'] extends true ? Uint8Array<ArrayBuffer> : null} */ (includeContent.awareness ? protocol.mergeAwarenessUpdates(cachedMessages.messages.filter(m => m.type === 'awareness:v1').map(m => m.update)) : null)
-    const lastClock = strm.maxRedisClock(persistedDoc.lastClock, cachedMessages.lastClock)
+    // `streamClock` is the last stream entry read, of any type - where a subscriber resumes.
+    // `lastClock` is the last message that changed the document - what compaction persists at
+    // and what the updated-documents listing reports; awareness after it doesn't count.
+    const streamClock = strm.maxRedisClock(persistedDoc.lastClock, cachedMessages.lastClock)
+    const lastClock = lastContentClock(cachedMessages.messages, persistedDoc.lastClock)
     const mergedContentIds = Y.mergeContentIds(contentids)
     cachedMessages.messages.forEach(m => {
       // only add update messages that are newer that what we currently know
@@ -363,6 +381,7 @@ export class YHub {
       contentmap: /** @type {Include['contentmap'] extends true ? Uint8Array<ArrayBuffer> : null} */ (mergedContentmap != null ? Y.encodeContentMap(mergedContentmap) : null),
       contentids: /** @type {Include['contentids'] extends true ? Uint8Array<ArrayBuffer> : null} */ (includeContent.contentids === true ? Y.encodeContentIds(mergedCids) : null),
       lastClock,
+      streamClock,
       lastPersistedClock: persistedDoc.lastClock,
       tombstone: persistedDoc.tombstone,
       references,

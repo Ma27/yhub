@@ -4,14 +4,15 @@ import * as buffer from 'lib0/buffer'
 import * as decoding from 'lib0/decoding'
 import * as math from 'lib0/math'
 import * as number from 'lib0/number'
+import * as promise from 'lib0/promise'
 import * as s from 'lib0/schema'
 import * as sha256 from 'lib0/hash/sha256'
 import { createApiEndpoint, DocDeletedError, $updateMessage, $versionCreate, $versionPut, $versionPatch } from './types.js'
 import { createDocumentPermissions, hasPermissions } from './permissions.js'
-import { redisClockToMs } from './stream.js'
-// benign import cycle with api.js - apiError/checkPermissions are only referenced at request
-// time, never during module evaluation
-import { apiError, checkPermissions, encodedAny } from './api.js'
+import { redisClockToMs, encodeDocUpdatedMember } from './stream.js'
+// benign import cycle with api.js - its exports are only referenced at request time, never during
+// module evaluation
+import { apiError, checkPermissions, encodedAny, runAuthHook, normalizeAuthorizeAnswer } from './api.js'
 import { createContentMap } from './y-utils.js'
 import { isComputeQueueFull } from './compute.js'
 import { logger } from './logger.js'
@@ -162,6 +163,7 @@ const changesetEndpoint = createApiEndpoint('changeset', {
       to: s.$uint.optional,
       ydoc: s.$boolean.optional,
       delta: s.$boolean.optional,
+      diff: s.$boolean.optional,
       attributions: s.$boolean.optional,
       // raw `k:v,k:v` string - parsed in the handler; the raw string is part of the cache key
       withCustomAttributions: s.$string.optional
@@ -170,28 +172,30 @@ const changesetEndpoint = createApiEndpoint('changeset', {
       const { docRef, query } = req
       const includeYdoc = query.ydoc ?? false
       const includeDelta = query.delta ?? false
+      const includeDiff = query.diff ?? false
       // reads clamp, never refuse: the query's `from` is limited to the granted ray up front, and
       // the clamped bound is what the requirement, the cache key, and the compute args all see -
       // a bounded reader can never hit a fuller cached response. The check runs before any cache
       // read (a revoked reader must not reach `cachedGet`); without history it fails on `from`.
-      // `?ydoc=`/`?delta=` render the document as it stood at `to` from a time-0 baseline - the
-      // history ray bounds attributions, never the content snapshot - so they demand ydoc read
+      // `?ydoc=`/`?delta=`/`?diff=` render the document as it stood at `to` from a time-0 baseline
+      // - the history ray bounds attributions, never the content snapshot - so they demand ydoc read
       const h = req.permissions?.history
       const from = math.max(query.from ?? 0, h ? h.from : 0)
-      checkPermissions(req.permissions, createDocumentPermissions({ history: { from }, ...((includeYdoc || includeDelta) && { ydoc: '-r--' }) }))
+      checkPermissions(req.permissions, createDocumentPermissions({ history: { from }, ...((includeYdoc || includeDelta || includeDiff) && { ydoc: '-r--' }) }))
       // lifted to the clamped `from`, so a `to` below the ray never inverts the window
       const to = math.max(query.to ?? number.MAX_SAFE_INTEGER, from)
       const by = query.by || ''
       const includeAttributions = query.attributions ?? false
       const withCustomAttributions = query.withCustomAttributions ? parseCustomAttributionsParam(query.withCustomAttributions) : null
       try {
-        const cacheArgs = [String(from), String(to), by, String(includeYdoc), String(includeDelta), String(includeAttributions), query.withCustomAttributions || '']
+        const cacheArgs = [String(from), String(to), by, String(includeYdoc), String(includeDelta), String(includeDiff), String(includeAttributions), query.withCustomAttributions || '']
         return encodedAny(await req.yhub.stream.cachedGet(docRef, 'changeset', cacheArgs, async () => {
-          const { nongcDoc, contentmap: contentmapBin, tombstone } = await req.yhub.getDoc(docRef, { nongc: true, contentmap: true })
+          const { nongcDoc, contentmap: contentmapBin, tombstone, lastClock } = await req.yhub.getDoc(docRef, { nongc: true, contentmap: true })
           if (tombstone != null) throw new DocDeletedError(docRef, tombstone)
           // the compute contract is nullable - unbounded is spelled `null` there, mapped back
-          // here only, never in the cache key
-          return req.yhub.computePool.changeset({ nongcDoc, contentmapBin, from: from === 0 ? null : from, to: to === number.MAX_SAFE_INTEGER ? null : to, by, withCustomAttributions, includeYdoc, includeDelta, includeAttributions }, { docRef })
+          // here only, never in the cache key. `t` is the document's last-change clock, the
+          // number the updated-documents listing reports - a poller stores it as its `from`.
+          return req.yhub.computePool.changeset({ nongcDoc, contentmapBin, from: from === 0 ? null : from, to: to === number.MAX_SAFE_INTEGER ? null : to, by, withCustomAttributions, includeYdoc, includeDelta, includeDiff, includeAttributions, t: redisClockToMs(lastClock) }, { docRef })
         }))
       } catch (err) {
         // before the log: a deleted document is not a server error, and polling one should not fill
@@ -274,6 +278,72 @@ const activityEndpoint = createApiEndpoint('activity', {
         log.error({ err, docRef }, 'error handling activity request')
         throw apiError(500, 'Failed to compute activity', { code: 'internal-error' })
       }
+    }
+  }
+})
+
+/**
+ * The documents of `org` changed after `since`, oldest first, as `{ docid, branch, t }` - `t`
+ * being the ms of the stream clock of the document's last change (an update, a prune or its
+ * deletion), the number the changeset response carries as `t` too. A poller stores `next` as its
+ * cursor and `t` per document, and fetches a listed document when its `t` moved. The protocol is
+ * documented in API.md ("Updated documents"): `since` is exclusive, a page never splits a
+ * millisecond (so `limit` is soft), `next === since` means caught up (a page can be empty while
+ * `next` advanced: every document on it was filtered out), a document may be listed twice across
+ * pages but is never missed.
+ *
+ * Two sources - the redis index of live streams and the persisted rows - are read with the page's
+ * `limit` each and merged. A source that returned fewer rows than `limit` is complete; one that
+ * returned `limit` rows is complete below the last clock it returned. So the merged list is complete
+ * below the clock at the cut, and the millisecond *at* the cut is re-read whole whenever the page
+ * is full. Deduplication happens after that: a document present in both sources (the redis entry
+ * at its last update, a later postgres row) must not move the cut.
+ */
+const updatedEndpoint = createApiEndpoint('updated', {
+  scope: 'org',
+  get: {
+    $query: { since: s.$uint.optional, limit: s.$uint.optional },
+    handler: async req => {
+      const { yhub, org, authInfo } = req
+      const since = req.query.since ?? 0
+      const limit = math.min(math.max(req.query.limit ?? 100, 1), 1000)
+      // the current millisecond is still open: a write landing in it after this read would be
+      // skipped by the next page's `since`, so the page ends before it
+      const to = (await yhub.stream.getTime()) - 1
+      /**
+       * @param {number} from
+       * @param {number} to
+       * @param {number} [limit]
+       */
+      const fetchBoth = async (from, to, limit) => (await promise.all([yhub.stream.getUpdatedDocs(org, { from, to, limit }), yhub.persistence.retrieveUpdatedDocs(org, { from, to, limit })])).flat().sort((a, b) => a.t - b.t)
+      let docs = await fetchBoth(since + 1, to, limit)
+      if (docs.length >= limit) {
+        // a full page: either source may have cut the millisecond at its end short, so that
+        // millisecond is re-read whole and the page ends at a boundary
+        const cut = docs[limit - 1].t
+        docs = docs.filter(d => d.t < cut).concat(await fetchBoth(cut, cut))
+      }
+      const next = docs.length > 0 ? array.last(docs).t : since
+      /**
+       * @type {Map<string, { docid: string, branch: string, t: number }>}
+       */
+      const page = new Map()
+      docs.forEach(d => page.set(encodeDocUpdatedMember({ org, docid: d.docid, branch: d.branch }), d))
+      const auth = /** @type {import('./types.js').AuthPlugin<any>} */ (yhub.conf.server?.auth)
+      const readable = createDocumentPermissions({ ydoc: '-r--' })
+      /**
+       * @type {Array<{ docid: string, branch: string, t: number }>}
+       */
+      const visible = []
+      // one authorize call per listed document, 16 in flight. A failing plugin fails the request
+      // (503 - see runAuthHook) rather than dropping the document: `next` would move past it.
+      const candidates = array.from(page.values()).sort((a, b) => a.t - b.t)
+      for (let i = 0; i < candidates.length && !req.aborted; i += 16) {
+        const chunk = candidates.slice(i, i + 16)
+        const answers = await promise.all(chunk.map(d => runAuthHook(yhub, 'authorize', () => auth.authorize('document', { org, docid: d.docid, branch: d.branch }, authInfo))))
+        answers.forEach((answer, j) => { hasPermissions(normalizeAuthorizeAnswer('document', answer), readable) && visible.push(chunk[j]) })
+      }
+      return { docs: visible, next }
     }
   }
 })
@@ -418,4 +488,4 @@ const versionEndpoint = createApiEndpoint('version', {
  *
  * @type {Array<import('./types.js').ApiEndpoint>}
  */
-export const builtinApi = [ydocEndpoint, rollbackEndpoint, pruneEndpoint, changesetEndpoint, activityEndpoint, versionEndpoint]
+export const builtinApi = [ydocEndpoint, rollbackEndpoint, pruneEndpoint, changesetEndpoint, activityEndpoint, versionEndpoint, updatedEndpoint]

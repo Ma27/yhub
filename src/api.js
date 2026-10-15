@@ -174,7 +174,7 @@ export const withAuthTimeout = (yhub, hook, p) => {
  * @param {'authenticate'|'authorize'} hook
  * @param {() => Promise<T>} run
  */
-const runAuthHook = async (yhub, hook, run) => {
+export const runAuthHook = async (yhub, hook, run) => {
   try {
     return await withAuthTimeout(yhub, hook, run())
   } catch (err) {

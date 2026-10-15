@@ -406,6 +406,33 @@ export class Persistence {
   }
 
   /**
+   * The documents of `org` whose persisted state or deletion has a clock in `[from, to]` (unix
+   * ms, inclusive), oldest first - the persisted half of the updated-documents listing. `created`
+   * is the stream clock of the last update a compaction persisted; a deletion is reported at its
+   * `deleted_at`. Rows are not deduplicated: a document appears twice while the row a compaction
+   * superseded is still being deleted.
+   *
+   * @param {string} org
+   * @param {object} range
+   * @param {number} range.from
+   * @param {number} range.to
+   * @param {number} [range.limit]
+   * @return {Promise<Array<{ docid: string, branch: string, t: number }>>}
+   */
+  async retrieveUpdatedDocs (org, { from, to, limit }) {
+    const rows = await this.sql`
+      SELECT docid, branch, created AS t FROM yhub_ydoc_v1
+      WHERE org = ${org} AND created BETWEEN ${from} AND ${to}
+      UNION ALL
+      SELECT docid, branch, deleted_at AS t FROM yhub_ydoc_tombstones_v1
+      WHERE org = ${org} AND deleted_at BETWEEN ${from} AND ${to}
+      ORDER BY t
+      ${limit == null ? this.sql`` : this.sql`LIMIT ${limit}`}
+    `
+    return rows.map(row => ({ docid: row.docid, branch: row.branch, t: number.parseInt(row.t) }))
+  }
+
+  /**
    * Record that `docRef` was deleted. `deletedAt` is never moved by a repeated deletion - a client
    * retry must not extend the retention window - but a soft deletion can be upgraded to a hard
    * one, never the reverse.

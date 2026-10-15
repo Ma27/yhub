@@ -119,8 +119,9 @@ CREATE TABLE yhub_ydoc_v1 (
     org         text,           -- Organization/namespace
     docid       text,           -- Document identifier
     branch      text,
-    t           text,           -- Redis stream clock of this version
-    created     INT8,           -- Unix ms, derived from `t`
+    t           text,           -- The last persisted update clock: the redis stream id of the last
+                                -- message that changed the document (update, prune or deletion)
+    created     INT8,           -- Unix ms, derived from `t` - the clock `GET /updated` reports
     gcDoc       bytea,          -- Garbage-collected update (or an S3 reference)
     nongcDoc    bytea,          -- Full-history update (or an S3 reference)
     contentmap  bytea,          -- Attribution content map

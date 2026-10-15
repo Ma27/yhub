@@ -513,7 +513,7 @@ const registerWebsocketServer = (server, prefix, cors) => {
             user.sendData(aw)
           }
         })
-        user.lastReceivedClock = doctable.lastClock
+        user.lastReceivedClock = doctable.streamClock
         yhub.stream.subscribe(user.docRef, user)
         user.keepAlive()
       } catch (err) {

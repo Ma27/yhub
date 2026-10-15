@@ -80,6 +80,33 @@ export const decodeRoomName = (rediskey, expectedPrefix) => {
 export const encodeQuarantineName = (docRef, prefix, qid) => `${prefix}:quarantine_room:${uriEncode(docRef.org)}:${uriEncode(docRef.docid)}:${uriEncode(docRef.branch)}:${qid}`
 
 /**
+ * The zset of `org`'s documents with live stream content, scored by the ms of the stream id of
+ * their last change (see `isContentMessage`; the `addMessage` script adds the member, `trimMessages`
+ * removes it together with the emptied stream - the two share a lifetime). It is the fresh half of
+ * the updated-documents listing; the persisted half is `yhub_ydoc_v1.created` and the tombstones.
+ * The braces around the org are a redis cluster hash tag - inert until the stream keys carry the
+ * same tag.
+ *
+ * @param {string} org
+ * @param {string} prefix
+ */
+export const encodeDocUpdatedKey = (org, prefix) => `${prefix}:doc_updated:{${uriEncode(org)}}`
+
+/**
+ * @param {t.DocRef} docRef
+ */
+export const encodeDocUpdatedMember = docRef => `${uriEncode(docRef.docid)}:${uriEncode(docRef.branch)}`
+
+/**
+ * @param {string} member
+ * @return {{ docid: string, branch: string }}
+ */
+export const decodeDocUpdatedMember = member => {
+  const i = member.indexOf(':')
+  return { docid: uriDecode(member.slice(0, i)), branch: uriDecode(member.slice(i + 1)) }
+}
+
+/**
  * Map a clock whose sequence is not a number to the valid stream id `${ms}-0`. Older releases
  * stamped the rows of `unsafePersistDoc` with `${ms}-I`, which redis rejects - and a single
  * rejected id fails the shared `XREAD` of every document subscribed on the server.
@@ -195,29 +222,50 @@ export class Stream {
       scripts: {
         ...this.redisClientConf.scripts,
         addMessage: redis.defineScript({
-          NUMBER_OF_KEYS: 1,
+          NUMBER_OF_KEYS: 2,
           SCRIPT: `
+            -- KEYS[1]  the document's stream (encodeRoomName)
+            -- KEYS[2]  the org's updated-documents zset (encodeDocUpdatedKey)
+            -- ARGV[1]  the document's member in that zset (encodeDocUpdatedMember)
+            -- ARGV[2]  "1" if the message changes the document (isContentMessage), "0" otherwise -
+            --          the message itself is an opaque lib0 blob, so this travels separately
+            -- ARGV[3]  the lib0-any encoded message
+            -- returns the stream id of the appended entry
             if redis.call("EXISTS", KEYS[1]) == 0 and redis.call("SISMEMBER", "${this.compactionDisabledSetName}", KEYS[1]) == 0 then
               redis.call("XADD", "${this.workerStreamName}", "*", "compact", KEYS[1])
               redis.call("XREADGROUP", "GROUP", "${this.workerGroupName}", "pending", "COUNT", 1, "STREAMS", "${this.workerStreamName}", ">")
             end
-            redis.call("XADD", KEYS[1], "*", "m", ARGV[1])
+            local id = redis.call("XADD", KEYS[1], "*", "m", ARGV[3])
+            if ARGV[2] == "1" then
+              redis.call("ZADD", KEYS[2], "GT", string.match(id, "^(%d+)"), ARGV[1])
+            end
+            return id
           `,
           /**
            * @param {import('@redis/client').CommandParser} parser
            * @param {string} key
+           * @param {string} docUpdatedKey
+           * @param {string} member
+           * @param {boolean} isContent
            * @param {Buffer} message
            */
-          parseCommand (parser, key, message) {
+          parseCommand (parser, key, docUpdatedKey, member, isContent, message) {
             log.debug({ key, messageSize: message.byteLength }, 'adding message')
             parser.pushKey(key)
-            parser.push(message)
+            parser.pushKey(docUpdatedKey)
+            parser.push(member, isContent ? '1' : '0', message)
           },
           transformReply (reply) { return reply }
         }),
         trimMessages: redis.defineScript({
-          NUMBER_OF_KEYS: 1,
+          NUMBER_OF_KEYS: 2,
           SCRIPT: `
+            -- KEYS[1]  the document's stream (encodeRoomName)
+            -- KEYS[2]  the org's updated-documents zset (encodeDocUpdatedKey)
+            -- ARGV[1]  minId: the last persisted stream id - entries up to it may go
+            -- ARGV[2]  maxAgeMs: entries younger than this stay regardless (minMessageLifetime)
+            -- ARGV[3]  the compact task id to ack, or "" for none
+            -- ARGV[4]  the document's member in the zset (encodeDocUpdatedMember)
             local function incStreamId(id)
               local ts, seq = string.match(id, "^(%d+)-?(%d*)$")
               if seq == "" then seq = "0" end
@@ -242,6 +290,7 @@ export class Stream {
               redis.call("XTRIM", KEYS[1], "MINID", minidLifetime)
               if redis.call("XLEN", KEYS[1]) == 0 then
                 redis.call("DEL", KEYS[1])
+                redis.call("ZREM", KEYS[2], ARGV[4])
               else
                 redis.call("XADD", "${this.workerStreamName}", "*", "compact", KEYS[1])
                 redis.call("XREADGROUP", "GROUP", "${this.workerGroupName}", "pending", "COUNT", 1, "STREAMS", "${this.workerStreamName}", ">")
@@ -251,13 +300,16 @@ export class Stream {
           /**
            * @param {import('@redis/client').CommandParser} parser
            * @param {string} streamName
+           * @param {string} docUpdatedKey
            * @param {string} minId
            * @param {number} maxAgeMs - in milliseconds
            * @param {string} taskId
+           * @param {string} member
            */
-          parseCommand (parser, streamName, minId, maxAgeMs, taskId) {
+          parseCommand (parser, streamName, docUpdatedKey, minId, maxAgeMs, taskId, member) {
             parser.pushKey(streamName)
-            parser.push(minId, maxAgeMs.toString(), taskId)
+            parser.pushKey(docUpdatedKey)
+            parser.push(minId, maxAgeMs.toString(), taskId, member)
           },
           transformReply (reply) { return reply }
         }),
@@ -329,6 +381,22 @@ export class Stream {
 
   async getActiveStreams () {
     return this.redis.keys(`${this.prefix}:room:*`)
+  }
+
+  /**
+   * The documents of `org` with live stream content whose last update has a stream clock in
+   * `[from, to]` (unix ms, inclusive), oldest first - see `encodeDocUpdatedKey`.
+   *
+   * @param {string} org
+   * @param {object} range
+   * @param {number} range.from
+   * @param {number} [range.to]
+   * @param {number} [range.limit]
+   * @return {Promise<Array<{ docid: string, branch: string, t: number }>>}
+   */
+  async getUpdatedDocs (org, { from, to, limit }) {
+    const members = await this.redis.zRangeWithScores(encodeDocUpdatedKey(org, this.prefix), from, to ?? '+inf', { BY: 'SCORE', ...(limit == null ? {} : { LIMIT: { offset: 0, count: limit } }) })
+    return members.map(({ value, score }) => ({ ...decodeDocUpdatedMember(value), t: score }))
   }
 
   /**
@@ -449,7 +517,7 @@ export class Stream {
    * @param {t.Message} m
    */
   addMessage (docRef, m) {
-    return this.redis.addMessage(encodeRoomName(docRef, this.prefix), Buffer.from(buffer.encodeAny(m)))
+    return this.redis.addMessage(encodeRoomName(docRef, this.prefix), encodeDocUpdatedKey(docRef.org, this.prefix), encodeDocUpdatedMember(docRef), t.isContentMessage(m.type), Buffer.from(buffer.encodeAny(m)))
   }
 
   /**
@@ -470,9 +538,13 @@ export class Stream {
     const qid = random.uuidv4()
     const quar = encodeQuarantineName(docRef, this.prefix, qid)
     try {
+      // the index entry goes too: the live key survives (the NOP), but the changes it indexed moved
+      // away, and a listing that kept it would have pollers refetch a document whose fetch answers
+      // the pre-quarantine state until compaction deletes the key
       await this.redis.multi()
         .rename(live, quar)
         .xAdd(live, '*', { nop: '1' })
+        .zRem(encodeDocUpdatedKey(docRef.org, this.prefix), encodeDocUpdatedMember(docRef))
         .exec()
     } catch (e) {
       const err = /** @type {any} */ (e)
@@ -555,10 +627,12 @@ export class Stream {
     const multi = this.redis.multi()
     for (const entry of entries) {
       const m = entry.message.m
+      if (m == null) continue
+      const type = buffer.decodeAny(/** @type {Uint8Array<ArrayBuffer>} */ (m)).type
       // auth:check directives are transient (their intent was fulfilled while they were live) and
       // not replay-idempotent - re-injected with a fresh clock they would kick matching
       // connections again, so they are dropped instead
-      if (m != null && buffer.decodeAny(/** @type {Uint8Array<ArrayBuffer>} */ (m)).type !== 'auth:check:v1') multi.addMessage(live, /** @type {Buffer} */ (m))
+      if (type !== 'auth:check:v1') multi.addMessage(live, encodeDocUpdatedKey(docRef.org, this.prefix), encodeDocUpdatedMember(docRef), t.isContentMessage(type), /** @type {Buffer} */ (m))
     }
     multi.del(quar)
     await multi.exec()
@@ -746,7 +820,7 @@ export class Stream {
    * @param {string?} taskid
    */
   async trimMessages (docRef, minId, maxAgeMs, taskid) {
-    await this.redis.trimMessages(encodeRoomName(docRef, this.prefix), sanitizeRedisClock(minId), maxAgeMs, taskid || '')
+    await this.redis.trimMessages(encodeRoomName(docRef, this.prefix), encodeDocUpdatedKey(docRef.org, this.prefix), sanitizeRedisClock(minId), maxAgeMs, taskid || '', encodeDocUpdatedMember(docRef))
   }
 
   /**

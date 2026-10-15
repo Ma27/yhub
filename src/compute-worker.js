@@ -1,6 +1,7 @@
 import { parentPort } from 'node:worker_threads'
 import * as Y from '@y/y'
 import * as encoding from 'lib0/encoding'
+import * as delta from 'lib0/delta'
 import { createContentMap, mergeUpdates } from './y-utils.js'
 import { logger } from './logger.js'
 
@@ -79,16 +80,16 @@ port.on('message', /** @param {import('./compute.js').ComputeTask} msg */ msg =>
       break
     }
     case 'changeset': {
-      const { nongcDoc: nongcDocBin, contentmapBin, from, to, by, withCustomAttributions, includeYdoc, includeDelta, includeAttributions } = msg
+      const { nongcDoc: nongcDocBin, contentmapBin, from, to, by, withCustomAttributions, includeYdoc, includeDelta, includeDiff, includeAttributions, t } = msg
       const contentmap = Y.decodeContentMap(contentmapBin)
       const filteredAttributions = filterContentMap(contentmap, from ?? undefined, to ?? undefined, by || undefined, undefined, withCustomAttributions)
       const afterContentIds = Y.createContentIdsFromContentMap(filterContentMap(contentmap, 0, to ?? undefined, undefined, undefined, null))
       /** @type {any} */
-      const response = {}
+      const response = { t }
       if (includeAttributions) {
         response.attributions = Y.encodeContentMap(filteredAttributions)
       }
-      if (includeYdoc || includeDelta) {
+      if (includeYdoc || includeDelta || includeDiff) {
         // The document as it was at `to`: a gc:false prefix of the nongc doc (content up to `to`),
         // with deleted content outside the changeset's attribution window garbage-collected away. Its
         // alive content is exactly the state at `to`, so the AttributionsRenderer overlay (attributions
@@ -98,6 +99,17 @@ port.on('message', /** @param {import('./compute.js').ComputeTask} msg */ msg =>
         Y.gcIdSet(doc, Y.diffIdSet(afterContentIds.deletes, filteredAttributions.deletes))
         if (includeDelta) {
           response.delta = doc.get().toDelta({ renderer: Y.createAttributionsRenderer(filteredAttributions) }).toJSON()
+        }
+        if (includeDiff) {
+          // the change alone, as an observeDeep event per root type, wrapped the way
+          // `Y.diffDocsToDelta` wraps them. The changed ids are (I−D) ∪ (D−I): content inserted
+          // *and* deleted inside the window is churn and renders as nothing.
+          const { inserts, deletes } = Y.createContentIdsFromContentMap(filteredAttributions)
+          const itemsToRender = Y.mergeIdSets([Y.diffIdSet(inserts, deletes), Y.diffIdSet(deletes, inserts)])
+          const modified = Y.computeModifiedFromItems(doc.store, itemsToRender)
+          const diff = delta.create()
+          doc.share.forEach((type, name) => { modified.has(type) && diff.modifyAttr(name, type.toDelta({ renderer: null, deep: true, itemsToRender, retainDeletes: true, modified })) })
+          response.diff = modified.size === 0 ? null : diff.done().toJSON()
         }
         if (includeYdoc) {
           response.ydoc = Y.encodeStateAsUpdate(doc)
